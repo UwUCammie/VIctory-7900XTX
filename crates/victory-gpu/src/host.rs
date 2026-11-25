@@ -8549,6 +8549,7 @@ impl Meter {
             return;
         }
         let drawn = crate::draw::drawn();
+        tracing::info!(target: "victory_bench", frames = self.frames, interval_us = elapsed.as_micros() as u64, draws = drawn - self.drawn, "presents");
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
