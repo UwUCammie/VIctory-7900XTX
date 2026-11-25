@@ -100,6 +100,7 @@ fn verify_readback(host: &crate::host::Host, slices: u16) {
             (None, 4.0),
             (Some(array_view(1, 1, 2)), 5.0),
             (Some(array_view(1, 2, u32::MAX)), 5.0),
+            (Some(two_d_view(2)), 6.0),
         ]
     };
     // The first list sets every host texel to 1, the second binds the default
@@ -173,6 +174,7 @@ fn verify_readback(host: &crate::host::Host, slices: u16) {
             let expected = match (mip, slice) {
                 (0, _) => 4f32.to_bits(),
                 (1, _) if slices == 1 || slice >= 1 => 5f32.to_bits(),
+                (2, 0) if slices > 1 => 6f32.to_bits(),
                 _ => 0x4a4a4a4a,
             };
             for y in 0..(8 >> mip) {

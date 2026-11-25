@@ -133,7 +133,7 @@ impl Target {
         let (mip, first, count, plane) = match words.map(crate::descriptor::host::uav_desc) {
             None => (0, 0, slices, 0),
             Some(desc) => match desc.ViewDimension {
-                D3D12_UAV_DIMENSION_TEXTURE2D if slices == 1 => {
+                D3D12_UAV_DIMENSION_TEXTURE2D => {
                     // SAFETY: the member named by ViewDimension.
                     let v = unsafe { desc.Anonymous.Texture2D };
                     (v.MipSlice, 0, 1, v.PlaneSlice)
