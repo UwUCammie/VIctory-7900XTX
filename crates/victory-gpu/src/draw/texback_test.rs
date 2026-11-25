@@ -2,7 +2,7 @@ use super::*;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_FLOAT, DXGI_SAMPLE_DESC};
 use windows::core::IUnknown;
 
-fn texture(slices: u16) -> IUnknown {
+fn texture(slices: u16, mips: u16) -> IUnknown {
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -12,7 +12,7 @@ fn texture(slices: u16) -> IUnknown {
         Width: 8,
         Height: 8,
         DepthOrArraySize: slices,
-        MipLevels: 3,
+        MipLevels: mips,
         Format: DXGI_FORMAT_R32_FLOAT,
         SampleDesc: DXGI_SAMPLE_DESC {
             Count: 1,
@@ -74,10 +74,33 @@ fn water_readback_preserves_texels_outside_bound_uavs() {
 
     verify_readback(host, 4);
     verify_readback(host, 1);
+    // Each of the six views covers one of three mips. Overlapping views
+    // on the array copy their shared slice once.
+    assert_eq!(crate::texback::landed_counts(), [2, 6, 6, 10, 5]);
+
+    let owner = texture(4, 1);
+    let list = host.new_list().unwrap();
+    let subset = Some(array_view(0, 1, 2));
+    for view in [None, subset, subset, Some(array_view(0, 4, u32::MAX))] {
+        readable(&list, ResourceType::Uav, &View::Unordered(owner.as_raw() as usize, 0, view));
+    }
+    list.close();
+    host.execute(&[&list]);
+    // The default view covers the whole resource, two restricted views
+    // overlap it, and the empty view contributes neither a bind nor a copy.
+    assert_eq!(crate::texback::landed_counts(), [3, 9, 8, 14, 5]);
+
+    let list = host.new_list().unwrap();
+    readable(&list, ResourceType::Uav, &View::Unordered(owner.as_raw() as usize, 0, subset));
+    list.close();
+    let (_, at, size) = crate::resource::title_texture(owner.as_raw().cast()).unwrap();
+    crate::texback::remapped(at, size);
+    host.execute(&[&list]);
+    assert_eq!(crate::texback::landed_counts(), [3, 9, 8, 14, 5]);
 }
 
 fn verify_readback(host: &crate::host::Host, slices: u16) {
-    let owner = texture(slices);
+    let owner = texture(slices, 3);
     let title = owner.as_raw().cast();
     let texture = crate::resource::host_copy(title).unwrap();
     let (layout, at, size) = crate::resource::title_texture(title).unwrap();

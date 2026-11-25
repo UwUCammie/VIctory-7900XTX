@@ -12,6 +12,10 @@
 //! the upstream trace; `0`: none), a list copies the mip and slices exposed by each
 //! bound texture UAV into a read-back buffer when it closes. Once the list
 //! has run, those texels are tiled into the texture's title memory.
+//! The periodic landing log counts valid UAV bindings on readbacks that
+//! reach the write to title memory. It follows the existing `copied` counter.
+//! Overlapping bindings count separately. Copied and skipped subresources
+//! count each mip and slice once per texture per landed list.
 //!
 //! shortcut: by kind, not by texture: textures of those kinds the title never
 //! reads are copied back too (about a megabyte per such list). The copy shows
@@ -20,7 +24,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -66,14 +70,20 @@ struct Ticket {
     valid: AtomicBool,
 }
 
-static TICKETS: Mutex<Vec<Weak<Ticket>>> = Mutex::new(Vec::new());
+#[derive(Default)]
+struct Tracking {
+    tickets: Vec<Weak<Ticket>>,
+    landed: Landed,
+}
+
+static TRACKED: LazyLock<Mutex<Tracking>> = LazyLock::new(Mutex::default);
 static TRACKING: AtomicBool = AtomicBool::new(false);
 
 fn track(owner: usize, at: usize, end: usize) -> Arc<Ticket> {
     let ticket = Arc::new(Ticket { owner, at, end, valid: AtomicBool::new(true) });
-    let mut tickets = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
-    tickets.retain(|weak| weak.strong_count() != 0);
-    tickets.push(Arc::downgrade(&ticket));
+    let mut tracked = TRACKED.lock().unwrap_or_else(|e| e.into_inner());
+    tracked.tickets.retain(|weak| weak.strong_count() != 0);
+    tracked.tickets.push(Arc::downgrade(&ticket));
     TRACKING.store(true, Ordering::Relaxed);
     ticket
 }
@@ -82,7 +92,7 @@ fn invalidate(matches: impl Fn(&Ticket) -> bool) {
     if !TRACKING.load(Ordering::Relaxed) {
         return;
     }
-    TICKETS.lock().unwrap_or_else(|e| e.into_inner()).retain(|weak| {
+    TRACKED.lock().unwrap_or_else(|e| e.into_inner()).tickets.retain(|weak| {
         let Some(ticket) = weak.upgrade() else { return false };
         if matches(&ticket) {
             ticket.valid.store(false, Ordering::Release);
@@ -109,6 +119,8 @@ pub(crate) struct Target {
     layout: victory_formats::texture::Layout,
     ticket: Arc<Ticket>,
     subresources: BTreeSet<u32>,
+    bindings: u64,
+    restricted_bindings: u64,
 }
 
 impl Target {
@@ -119,7 +131,10 @@ impl Target {
         let (layout, at, size) = crate::resource::title_texture(resource)?;
         let end = at.checked_add(size).filter(|&end| at != 0 && end > at)?;
         let ticket = track(resource as usize, at, end);
-        let mut target = Self { copy, layout, ticket, subresources: BTreeSet::new() };
+        let mut target = Self {
+            copy, layout, ticket, subresources: BTreeSet::new(),
+            bindings: 0, restricted_bindings: 0,
+        };
         target.include(view);
         (!target.subresources.is_empty()).then_some(target)
     }
@@ -149,7 +164,9 @@ impl Target {
         let mips = self.layout.desc.mips;
         // UINT_MAX means every remaining slice from FirstArraySlice.
         let end = if count == u32::MAX { Some(slices) } else { first.checked_add(count) };
-        if plane == 0 && mip < mips && let Some(end) = end.filter(|&end| end <= slices) {
+        if plane == 0 && mip < mips && let Some(end) = end.filter(|&end| first < end && end <= slices) {
+            self.bindings += 1;
+            self.restricted_bindings += u64::from(mips > 1 || end - first < slices);
             self.subresources.extend((first..end).map(|slice| slice * mips + mip));
         }
     }
@@ -167,6 +184,8 @@ pub(crate) struct Back {
     subresources: Vec<Subresource>,
     layout: victory_formats::texture::Layout,
     ticket: Arc<Ticket>,
+    bindings: u64,
+    restricted_bindings: u64,
 }
 
 impl Back {
@@ -219,15 +238,33 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
         // SAFETY: an open list; the texture is in the copy-source state.
         unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
-    Some(Back { buffer, subresources, layout: target.layout, ticket: target.ticket })
+    Some(Back {
+        buffer, subresources, layout: target.layout, ticket: target.ticket,
+        bindings: target.bindings, restricted_bindings: target.restricted_bindings,
+    })
+}
+
+#[derive(Default)]
+struct Landed {
+    copies: u64,
+    bindings: u64,
+    restricted_bindings: u64,
+    copied_subresources: u64,
+    skipped_subresources: u64,
+}
+
+#[cfg(test)]
+pub(crate) fn landed_counts() -> [u64; 5] {
+    let tracked = TRACKED.lock().unwrap_or_else(|e| e.into_inner());
+    let t = &tracked.landed;
+    [t.copies, t.bindings, t.restricted_bindings, t.copied_subresources, t.skipped_subresources]
 }
 
 /// Once the list has run, tile its texels back into the same title allocation.
 pub(crate) fn land(back: &Back) {
-    static COPIED: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
     let _mapping = crate::watch::title_memory_reading();
-    let _ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut tracked = TRACKED.lock().unwrap_or_else(|e| e.into_inner());
     if !back.ticket.valid.load(Ordering::Acquire) {
         let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
         if skipped.is_power_of_two() {
@@ -269,9 +306,17 @@ pub(crate) fn land(back: &Back) {
     // SAFETY: mapped above.
     unsafe { back.buffer.Unmap(0, None) };
     crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
-    let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
-    if copied == 1 || copied.is_multiple_of(128) {
-        tracing::info!(copied, bytes = size, "texture readback landed");
+    let totals = &mut tracked.landed;
+    let copied_subresources = back.subresources.len() as u64;
+    totals.copies += 1;
+    totals.bindings += back.bindings;
+    totals.restricted_bindings += back.restricted_bindings;
+    totals.copied_subresources += copied_subresources;
+    totals.skipped_subresources += u64::from(mips) * u64::from(back.layout.desc.depth) - copied_subresources;
+    if totals.copies == 1 || totals.copies.is_multiple_of(128) {
+        tracing::info!(copied = totals.copies, bytes = size, bindings = totals.bindings,
+            restricted_bindings = totals.restricted_bindings, copied_subresources = totals.copied_subresources,
+            skipped_subresources = totals.skipped_subresources, "texture readback landed");
     }
 }
 
