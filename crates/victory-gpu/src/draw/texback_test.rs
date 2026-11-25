@@ -2,7 +2,7 @@ use super::*;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_FLOAT, DXGI_SAMPLE_DESC};
 use windows::core::IUnknown;
 
-fn texture(slices: u16, mips: u16) -> IUnknown {
+fn texture(slices: u16, mips: u16, layout: D3D12_TEXTURE_LAYOUT) -> IUnknown {
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -14,6 +14,7 @@ fn texture(slices: u16, mips: u16) -> IUnknown {
         DepthOrArraySize: slices,
         MipLevels: mips,
         Format: DXGI_FORMAT_R32_FLOAT,
+        Layout: layout,
         SampleDesc: DXGI_SAMPLE_DESC {
             Count: 1,
             Quality: 0,
@@ -78,7 +79,7 @@ fn water_readback_preserves_texels_outside_bound_uavs() {
     // on the array copy their shared slice once.
     assert_eq!(crate::texback::landed_counts(), [2, 6, 6, 10, 5]);
 
-    let owner = texture(4, 1);
+    let owner = texture(4, 1, D3D12_TEXTURE_LAYOUT_UNKNOWN);
     let list = host.new_list().unwrap();
     let subset = Some(array_view(0, 1, 2));
     for view in [None, subset, subset, Some(array_view(0, 4, u32::MAX))] {
@@ -97,10 +98,34 @@ fn water_readback_preserves_texels_outside_bound_uavs() {
     crate::texback::remapped(at, size);
     host.execute(&[&list]);
     assert_eq!(crate::texback::landed_counts(), [3, 9, 8, 14, 5]);
+
+    // An XOR layout can be sized, but the layer cannot tile its texels.
+    let xor = victory_formats::texture::Swizzle::SW_4KB_S_X;
+    let owner = texture(1, 1, D3D12_TEXTURE_LAYOUT(0x100 | xor.0 as i32));
+    let title = owner.as_raw().cast();
+    let (layout, at, size) = crate::resource::title_texture(title).unwrap();
+    assert!(!layout.addressable());
+    let copy = crate::resource::host_copy(title).unwrap();
+    // SAFETY: the owned allocation covers size bytes until owner is released.
+    unsafe { (at as *mut u8).write_bytes(0x5a, size) };
+    for _ in 0..2 {
+        let list = host.new_list().unwrap();
+        readable(&list, ResourceType::Uav, &View::Unordered(title as usize, 0, None));
+        list.close();
+        assert_eq!(list.recorded_texture_readbacks(), 0);
+        host.execute(&[&list]);
+        assert_eq!(
+            copy.state.load(std::sync::atomic::Ordering::Relaxed),
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32
+        );
+    }
+    // SAFETY: the list has finished and owner is still live.
+    assert!(unsafe { std::slice::from_raw_parts(at as *const u8, size) }.iter().all(|&b| b == 0x5a));
+    assert_eq!(crate::texback::landed_counts(), [3, 9, 8, 14, 5]);
 }
 
 fn verify_readback(host: &crate::host::Host, slices: u16) {
-    let owner = texture(slices, 3);
+    let owner = texture(slices, 3, D3D12_TEXTURE_LAYOUT_UNKNOWN);
     let title = owner.as_raw().cast();
     let texture = crate::resource::host_copy(title).unwrap();
     let (layout, at, size) = crate::resource::title_texture(title).unwrap();

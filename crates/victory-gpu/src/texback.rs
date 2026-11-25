@@ -54,12 +54,17 @@ fn kinds() -> &'static [(u64, u32, u32)] {
     })
 }
 
-/// Whether title texture `resource` is of a kind copied back.
-pub(crate) fn wanted(resource: This) -> bool {
+/// The title format when `resource` is of a kind copied back.
+pub(crate) fn wanted_format(resource: This) -> Option<u32> {
     let kinds = kinds();
-    !kinds.is_empty()
-        && crate::resource::texture_kind(resource).is_some_and(|k| kinds.contains(&k))
+    if kinds.is_empty() {
+        return None;
+    }
+    let kind = crate::resource::texture_kind(resource)?;
+    kinds.contains(&kind).then_some(kind.2)
 }
+
+static TILE_WARNING: std::sync::Once = std::sync::Once::new();
 
 /// An outstanding write to a specific allocation. Mapping and resource
 /// changes invalidate only the writes that could touch the replaced memory.
@@ -117,6 +122,7 @@ pub(crate) fn remapped(at: usize, len: usize) {
 pub(crate) struct Target {
     pub(crate) copy: Arc<crate::resource::HostTexture>,
     layout: victory_formats::texture::Layout,
+    format: u32,
     ticket: Arc<Ticket>,
     subresources: BTreeSet<u32>,
     bindings: u64,
@@ -124,7 +130,7 @@ pub(crate) struct Target {
 }
 
 impl Target {
-    pub(crate) fn new(resource: This, view: Option<&[u32; 10]>) -> Option<Self> {
+    pub(crate) fn new(resource: This, format: u32, view: Option<&[u32; 10]>) -> Option<Self> {
         // Keep the host copy independently of the title's resource lifetime.
         let copy = crate::resource::host_copy(resource)?;
         let _mapping = crate::watch::title_memory_reading();
@@ -132,7 +138,7 @@ impl Target {
         let end = at.checked_add(size).filter(|&end| at != 0 && end > at)?;
         let ticket = track(resource as usize, at, end);
         let mut target = Self {
-            copy, layout, ticket, subresources: BTreeSet::new(),
+            copy, layout, format, ticket, subresources: BTreeSet::new(),
             bindings: 0, restricted_bindings: 0,
         };
         target.include(view);
@@ -140,6 +146,24 @@ impl Target {
     }
 
     pub(crate) fn owner(&self) -> usize { self.ticket.owner }
+
+    /// Whether the title layout can accept any subresource after a GPU copy.
+    pub(crate) fn can_tile(&self) -> bool {
+        if self.layout.addressable() {
+            return true;
+        }
+        TILE_WARNING.call_once(|| {
+            let first = self.subresources.first().copied();
+            let mips = self.layout.desc.mips;
+            tracing::warn!(
+                format = self.format, layout = ?self.layout.desc,
+                first_mip = first.map(|i| i % mips), first_slice = first.map(|i| i / mips),
+                subresources = self.subresources.len(),
+                "skipping texture readback because the title layout has no address equation"
+            );
+        });
+        false
+    }
 
     /// A texture UAV can write one mip and the array slices in its view.
     /// The default view covers mip zero of every slice.
@@ -296,8 +320,7 @@ pub(crate) fn land(back: &Back) {
         // SAFETY: the subresource's part of the mapped buffer.
         let linear = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len) };
         if let Err(e) = back.layout.tile(&mut tiled, mip, slice, linear, pitch, depth_pitch) {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
+            TILE_WARNING.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
             // SAFETY: mapped above.
             unsafe { back.buffer.Unmap(0, None) };
             return;
