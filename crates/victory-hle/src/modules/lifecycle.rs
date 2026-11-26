@@ -110,7 +110,7 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (style, x, y, width, height) = place(parent, style, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -136,7 +136,7 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (style, x, y, width, height) = place(parent, style, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
@@ -145,6 +145,36 @@ pub extern "system" fn CreateWindowExA(
     };
     hook(hwnd);
     hwnd
+}
+
+/// `VICTORY_FULLSCREEN=1`: the title's top-level window becomes a borderless
+/// window covering the primary monitor (Wine maps it to a full-screen
+/// window); what it shows is scaled to it, as with [`fit`]. Otherwise the
+/// window is fitted to the work area.
+fn place(
+    parent: HWND,
+    style: u32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> (u32, i32, i32, i32, i32) {
+    static FULLSCREEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let fullscreen = *FULLSCREEN
+        .get_or_init(|| std::env::var_os("VICTORY_FULLSCREEN").is_some_and(|v| v == "1"));
+    if fullscreen && parent.is_null() && style & wm::WS_CHILD == 0 {
+        // SAFETY: plain metric queries.
+        let (w, h) = unsafe {
+            (wm::GetSystemMetrics(wm::SM_CXSCREEN), wm::GetSystemMetrics(wm::SM_CYSCREEN))
+        };
+        if w > 0 && h > 0 {
+            let style = (style & !wm::WS_OVERLAPPEDWINDOW) | wm::WS_POPUP;
+            tracing::info!(width, height, to = ?(w, h), "title window made full screen");
+            return (style, 0, 0, w, h);
+        }
+    }
+    let (x, y, width, height) = fit(parent, x, y, width, height);
+    (style, x, y, width, height)
 }
 
 /// A console title sizes its window to its render target (
