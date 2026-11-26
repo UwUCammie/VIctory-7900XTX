@@ -4397,6 +4397,17 @@ fn command_signature_creation_releases_the_cache_and_keeps_a_competing_result() 
     assert_eq!(cached_command_signature(&cache, 2, || unreachable!()), Some(200));
     assert_eq!(cached_command_signature(&cache, 3, || None), None);
     assert_eq!(cached_command_signature(&cache, 3, || Some(300)), Some(300));
+
+    let found = cached_command_signature(&cache, 4, || {
+        assert!(cache.try_lock().is_ok());
+        std::thread::scope(|scope| {
+            let winner = scope.spawn(|| cached_command_signature(&cache, 4, || Some(400)));
+            assert_eq!(winner.join().unwrap(), Some(400));
+        });
+        None
+    });
+    assert_eq!(found, Some(400));
+    assert_eq!(cached_command_signature(&cache, 4, || unreachable!()), Some(400));
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data
