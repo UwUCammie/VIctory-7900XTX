@@ -391,13 +391,28 @@ mod tests {
             let placed = place_in(device, start, len).unwrap_or_else(|e| panic!("not placed: {e:?}"));
             assert_eq!(placed.bias, 0x40);
             let mut rig = crate::inplace::Rig::new(device).unwrap();
-            for (i, b) in std::slice::from_raw_parts_mut(start as *mut u8, len as usize).iter_mut().enumerate() {
-                *b = (i * 7 + 3) as u8;
-            }
-            let got = rig.fetch(&placed.buffer, placed.bias, len as usize).unwrap();
-            assert!(got == std::slice::from_raw_parts(start as *const u8, len as usize), "the card reads the title's bytes, across both views");
-            rig.store(&placed.buffer, placed.bias + 3 * K as u64, &[0x5a; 256]).unwrap();
-            assert!(std::slice::from_raw_parts((start + 3 * K as u64) as *const u8, 256).iter().all(|&b| b == 0x5a), "the card's write shows in the title's view");
+            // Give adjacent pages distinct data, and write each mapped view separately.
+            let expected: Vec<u8> = (0..len as usize).map(|i| (i * 7 + (i >> 8) + (i >> 16) + 3) as u8).collect();
+            let first_len = 2 * K - 0x40;
+            std::ptr::copy_nonoverlapping(expected.as_ptr(), start as *mut u8, first_len);
+            std::ptr::copy_nonoverlapping(expected.as_ptr().add(first_len), views[1].Value.cast(), expected.len() - first_len);
+
+            // A third CPU mapping checks ordinary section aliasing separately from the GPU import.
+            let alias = mem::MapViewOfFile(section, mem::FILE_MAP_READ, 0, 0, 8 * K);
+            assert!(!alias.Value.is_null(), "could not map the section for the CPU alias check");
+            let alias_bytes = alias.Value.cast::<u8>().add(K + 0x40);
+            let cpu_alias_reads = std::slice::from_raw_parts(alias_bytes, expected.len()) == expected.as_slice();
+            let got = rig.fetch(&placed.buffer, placed.bias, expected.len()).unwrap();
+            let mismatched = expected.iter().zip(&got).position(|(cpu, gpu)| cpu != gpu);
+            let all_zero = got.iter().all(|byte| *byte == 0);
+
+            let marker = [0x5a; 256];
+            let offset = 3 * K;
+            rig.store(&placed.buffer, placed.bias + offset as u64, &marker).unwrap();
+            let original_sees_write = std::slice::from_raw_parts((start + offset as u64) as *const u8, marker.len()) == marker;
+            let alias_sees_write = std::slice::from_raw_parts(alias_bytes.add(offset), marker.len()) == marker;
+            let gpu_sees_write = rig.fetch(&placed.buffer, placed.bias + offset as u64, marker.len()).unwrap() == marker;
+            assert_ne!(mem::UnmapViewOfFile(alias), 0);
             // Another buffer in the same stretch: the same region.
             let regions = REGIONS.lock().unwrap().len();
             let second = place_in(device, base + 6 * K as u64, 100).unwrap_or_else(|e| panic!("not placed: {e:?}"));
@@ -413,6 +428,11 @@ mod tests {
             mem::VirtualFree(hole.cast(), 0, mem::MEM_RELEASE);
             mem::VirtualFree(hole.add(3 * K).cast(), 0, mem::MEM_RELEASE);
             windows_sys::Win32::Foundation::CloseHandle(section);
+            assert!(
+                cpu_alias_reads && mismatched.is_none() && original_sees_write && alias_sees_write && gpu_sees_write,
+                "CPU alias matches={cpu_alias_reads}, GPU first mismatch={mismatched:?}, GPU read all zero={all_zero}, \
+                 GPU write visible in original={original_sees_write}, in CPU alias={alias_sees_write}, on GPU={gpu_sees_write}"
+            );
         }
     }
 }
