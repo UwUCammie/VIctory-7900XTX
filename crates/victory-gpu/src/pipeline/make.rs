@@ -252,10 +252,18 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
     p.made.get().is_some_and(|made| made.is_some())
 }
 
-/// At the title's creation of a pipeline: starts it at once if an earlier
-/// run drew with it (during loading, so the world's first frames find it).
+/// Start previously used pipelines at creation. With a byte limit, also
+/// give small compute pipelines a head start on their first dispatch.
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    static MAX_BYTES: OnceLock<usize> = OnceLock::new();
+    let small_compute = p.compute && p.shaders.first().is_some_and(|shader| {
+        let limit = MAX_BYTES.get_or_init(|| {
+            std::env::var("VICTORY_EARLY_COMPUTE_MAX_BYTES").ok()
+                .and_then(|value| value.trim().parse().ok()).unwrap_or(0)
+        });
+        shader.container.len() <= *limit
+    });
+    if !p.shaders.is_empty() && (small_compute || super::library::wanted_early(&p.key)) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
     }
