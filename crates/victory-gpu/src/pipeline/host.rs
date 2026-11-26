@@ -477,10 +477,16 @@ impl HostPipeline {
         let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
-        let mut heap_flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+        static SELECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let select = *SELECT.get_or_init(|| std::env::var_os("VICTORY_TEST_DIRECT_HEAP_FLAGS").is_some_and(|v| v == "1"));
+        let both_heaps = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+            | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+        let mut heap_flags = if select { D3D12_ROOT_SIGNATURE_FLAG_NONE } else { both_heaps };
         for &(shader, visibility) in &stages {
             let t = &shader.translated()?.host;
-            heap_flags |= direct_heap_flags(&t.dxil);
+            if select {
+                heap_flags |= direct_heap_flags(&t.dxil);
+            }
             let mut stage = Stage {
                 shader: shader.clone(),
                 user_data: None,
@@ -595,6 +601,10 @@ impl HostPipeline {
                 });
             }
             bound.push(stage);
+        }
+        if heap_flags != both_heaps {
+            static FIRST: std::sync::Once = std::sync::Once::new();
+            FIRST.call_once(|| tracing::info!(?heap_flags, "narrowed the direct heap flags on a host root signature"));
         }
         let (root, root_blob) = match root_signature(
             &host.device,
