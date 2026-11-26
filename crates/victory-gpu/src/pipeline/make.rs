@@ -338,9 +338,19 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// VICTORY_EARLY_COMPUTE=1 also queues compute pipelines whose dispatches
 /// would wait for them. First use can still promote a queued pipeline.
 pub(crate) fn early(p: &Arc<Pending>) {
-    static EARLY_COMPUTE: OnceLock<bool> = OnceLock::new();
-    let cold_compute = p.compute
-        && *EARLY_COMPUTE.get_or_init(|| std::env::var_os("VICTORY_EARLY_COMPUTE").is_some_and(|v| v == "1"));
+    // Small compute shaders can finish before a one-shot dispatch while the
+    // larger builds would keep the workers busy through the playable scene.
+    static EARLY_COMPUTE_LIMIT: OnceLock<usize> = OnceLock::new();
+    let cold_compute = p.compute && p.shaders.first().is_some_and(|shader| {
+        let limit = EARLY_COMPUTE_LIMIT.get_or_init(|| {
+            if !std::env::var_os("VICTORY_EARLY_COMPUTE").is_some_and(|v| v == "1") {
+                return 0;
+            }
+            std::env::var("VICTORY_EARLY_COMPUTE_MAX_BYTES")
+                .map_or(usize::MAX, |value| value.trim().parse().unwrap_or(0))
+        });
+        shader.container.len() <= *limit
+    });
     if !p.shaders.is_empty() && (cold_compute || super::library::wanted_early(&p.key)) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
