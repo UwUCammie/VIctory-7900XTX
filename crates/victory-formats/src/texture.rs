@@ -181,8 +181,30 @@ pub struct Layout {
     pattern: &'static SwizzlePattern,
 }
 
-type SwizzlePattern = [Vec<u32>; 3];
-static EMPTY_PATTERN: SwizzlePattern = [const { Vec::new() }; 3];
+#[derive(Debug, PartialEq, Eq)]
+struct SwizzlePattern {
+    axis: [Vec<u32>; 3],
+    /// Elements and bytes in each uniform column run used by the copy loop.
+    column_run: Option<(usize, usize)>,
+}
+
+static EMPTY_PATTERN: SwizzlePattern = SwizzlePattern {
+    axis: [const { Vec::new() }; 3],
+    column_run: None,
+};
+
+fn column_run(pat: &[u32], element_bytes: usize) -> Option<(usize, usize)> {
+    let mut k = 1usize;
+    while k < pat.len() && pat[k] == pat[k - 1] + element_bytes as u32 {
+        k += 1;
+    }
+    let bytes = k * element_bytes;
+    let uniform = k.is_power_of_two()
+        && matches!(bytes, 4 | 8 | 16 | 32)
+        && pat.len().is_multiple_of(k)
+        && (1..pat.len()).all(|i| (pat[i] == pat[i - 1] + element_bytes as u32) == !i.is_multiple_of(k));
+    uniform.then_some((k, bytes))
+}
 
 /// Micro tile (256 bytes) patterns by log2 of the element size: for each
 /// address bit, the element coordinate bit it takes (`x0`, `y1`, `z0`...),
@@ -261,7 +283,11 @@ fn shared_pattern(kind: usize, element_log2: u32, block_log2: u32) -> &'static S
         [const { [const { [const { OnceLock::new() }; 5] }; 3] }; 3];
     let block_index = ((block_log2 - 8) / 4) as usize;
     PATTERNS[kind][block_index][element_log2 as usize]
-        .get_or_init(|| pattern(kind, element_log2, block_log2).map(|bits| spread(&bits)))
+        .get_or_init(|| {
+            let axis = pattern(kind, element_log2, block_log2).map(|bits| spread(&bits));
+            let column_run = column_run(&axis[0], 1 << element_log2);
+            SwizzlePattern { axis, column_run }
+        })
 }
 
 const MAX_MIPS: u32 = 16;
@@ -534,7 +560,7 @@ impl Layout {
     /// differ). Titles use them for render targets and depth, which the
     /// host renders; add them when a title copies into or out of one.
     pub fn addressable(&self) -> bool {
-        self.desc.swizzle == Swizzle::LINEAR || !self.pattern[0].is_empty()
+        self.desc.swizzle == Swizzle::LINEAR || !self.pattern.axis[0].is_empty()
     }
 
     /// The slice and the depth inside it for `z` (an array slice or a 3D
@@ -582,7 +608,7 @@ impl Layout {
         // offset inside the tail block.
         let y = y + m.tail.map_or(0, |t| t.y);
         let blocks = u64::from(y / bh) * u64::from(m.pitch / bw);
-        (blocks << log2) + u64::from(self.pattern[1][(y % bh) as usize] | self.pattern[2][z as usize])
+        (blocks << log2) + u64::from(self.pattern.axis[1][(y % bh) as usize] | self.pattern.axis[2][z as usize])
     }
 
     /// The part of an address that depends on the column.
@@ -590,7 +616,7 @@ impl Layout {
         let bw = self.block[0];
         let x = x + m.tail.map_or(0, |t| t.x);
         (u64::from(x / bw) << self.alignment.trailing_zeros())
-            + u64::from(self.pattern[0][(x % bw) as usize])
+            + u64::from(self.pattern.axis[0][(x % bw) as usize])
     }
 
     /// Depth slices a subresource of mip `mip` covers: the mip's depth for
@@ -807,7 +833,7 @@ impl Layout {
             // The depth bits are disjoint from the precomputed row bits.
             let base = u64::from(s) * self.slice_size
                 + m.offset
-                + u64::from(self.pattern[2][inner as usize]);
+                + u64::from(self.pattern.axis[2][inner as usize]);
             let z_lin = z as usize * depth_pitch;
             let height = m.height as usize;
             let mut y = 0;
@@ -874,7 +900,7 @@ impl Layout {
     }
 }
 
-/// One tiled row's contiguous runs, detected once per copy from the
+/// One tiled row's contiguous runs, based on the cached width from the
 /// swizzle pattern's column table: equal runs of `k` elements starting at
 /// multiples of `k`, so the row's tiled side repeats the same runs shifted
 /// by whole blocks (a mip tail shifts the grid). `cols` holds the tiled
@@ -889,20 +915,9 @@ struct RowRuns {
 impl RowRuns {
     /// Detects the uniform runs of mip `m`'s rows for copy widths 4, 8, 16 or 32.
     fn new(layout: &Layout, m: &Mip, n: usize) -> Option<RowRuns> {
-        let pat = &layout.pattern[0];
-        let bw = layout.block[0] as usize;
-        let mut k = 1usize;
-        while k < pat.len() && pat[k] == pat[k - 1] + n as u32 {
-            k += 1;
-        }
-        let uniform = k.is_power_of_two()
-            && pat.len() == bw
-            && bw.is_multiple_of(k)
-            && (1..pat.len()).all(|i| (pat[i] == pat[i - 1] + n as u32) == !i.is_multiple_of(k));
-        let w = k * n;
-        // GFX10 tail shifts use whole micro tiles, which start on run boundaries.
+        let (k, w) = layout.pattern.column_run?;
         let shift = m.tail.map_or(0, |t| t.x as usize);
-        if !uniform || !matches!(w, 4 | 8 | 16 | 32) || !shift.is_multiple_of(k) {
+        if layout.pattern.axis[0].len() != layout.block[0] as usize || w != k * n || !shift.is_multiple_of(k) {
             return None;
         }
         let width = m.width as usize;
@@ -1191,8 +1206,8 @@ mod tests {
                 let [w, h, d] = l.block;
                 assert_eq!(u64::from(w * h * d) << e, 1 << log2, "{log2} {e}");
                 // The pattern covers exactly the block's coordinates.
-                assert_eq!(l.pattern[0].len() as u32, w);
-                assert_eq!(l.pattern[1].len() as u32, h);
+                assert_eq!(l.pattern.axis[0].len() as u32, w);
+                assert_eq!(l.pattern.axis[1].len() as u32, h);
             }
         }
         // 64 KiB, 16-byte elements: 64x64 (a 256x256 BC7 texture).
@@ -1368,7 +1383,7 @@ mod tests {
                 })
                 .unwrap();
                 let expected = pattern(kind, element_log2, block_log2).map(|bits| spread(&bits));
-                assert_eq!(first.pattern, &expected);
+                assert_eq!(first.pattern.axis, expected);
                 assert!(std::ptr::eq(first.pattern, second.pattern));
                 assert!(std::ptr::eq(first.pattern, first.clone().pattern));
             }
