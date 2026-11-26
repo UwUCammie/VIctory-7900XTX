@@ -321,7 +321,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
-        start(p, REQUESTED);
+        start(p, REQUESTED, false);
         wait(p, crate::frame::current());
     }
     p.made.get()?.as_ref()
@@ -345,9 +345,20 @@ pub(crate) fn early(p: &Arc<Pending>) {
         });
         shader.container.len() <= *limit
     });
-    if !p.shaders.is_empty() && (small_compute || super::library::wanted_early(&p.key)) {
+    if p.shaders.is_empty() {
+        return;
+    }
+    let wanted = small_compute || super::library::wanted_early(&p.key);
+    // Give other compute builds only the existing slow-build slots. First
+    // use can promote a waiting job without adding a second queue entry
+    // to the count of unfinished pipelines.
+    static BACKGROUND: OnceLock<bool> = OnceLock::new();
+    let background = !wanted && p.compute
+        && *BACKGROUND.get_or_init(|| std::env::var_os("VICTORY_BACKGROUND_COMPUTE").is_some_and(|v| v == "1"))
+        && slow_limit() != usize::MAX;
+    if wanted || background {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p, EARLY);
+        start(p, EARLY, background);
     }
 }
 
@@ -632,7 +643,7 @@ static AVAILABLE: Condvar = Condvar::new();
 
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
-fn start(p: &Arc<Pending>, priority: u8) {
+fn start(p: &Arc<Pending>, priority: u8, background: bool) {
     if p.queue_state.load(Ordering::Relaxed) >= priority {
         return;
     }
@@ -643,7 +654,8 @@ fn start(p: &Arc<Pending>, priority: u8) {
         return;
     }
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(new) = queue.push(p, priority) {
+    let added = if background { queue.push_as(p, priority, true) } else { queue.push(p, priority) };
+    if let Some(new) = added {
         if new {
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
