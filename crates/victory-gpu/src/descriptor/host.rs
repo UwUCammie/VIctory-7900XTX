@@ -6001,6 +6001,7 @@ mod tests {
         assert_eq!(a.free.load(Relaxed), free, "another heap's identity gave the range back");
         a.release(a.id(), first, 2);
         assert_eq!(a.free.load(Relaxed), free + 2, "their own heap did not get the range back");
+        println!("verified that only the allocating D3D12 heap can return the dynamic range");
     }
 
     #[test]
