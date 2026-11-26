@@ -347,6 +347,16 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
+/// A title recording thread can bind a compute pipeline before the submission
+/// thread reaches its first dispatch. Queue only that work and let a dispatch
+/// promote it if it is still waiting. Graphics and unused pipelines stay idle.
+pub(super) fn first_bind(p: &Arc<Pending>) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if p.compute && *ON.get_or_init(|| std::env::var_os("VICTORY_COMPUTE_ON_BIND").is_some_and(|v| v == "1")) {
+        start(p, EARLY);
+    }
+}
+
 /// Whether the frame's budget is one for all threads together: a thread
 /// that waits takes what is left of it and gives back what it did not
 /// use. Counted only when a wait had ended, the budget was one per thread:
