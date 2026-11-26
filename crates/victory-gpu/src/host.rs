@@ -9429,6 +9429,13 @@ impl Meter {
 
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
+        static TRACE: OnceLock<bool> = OnceLock::new();
+        if *TRACE.get_or_init(|| std::env::var_os("VICTORY_FRAME_TRACE").is_some_and(|value| value == "1")) {
+            static FIRST: OnceLock<std::time::Instant> = OnceLock::new();
+            let now = std::time::Instant::now();
+            let origin = FIRST.get_or_init(|| now);
+            tracing::info!(target: "victory_bench", since_first_us = now.duration_since(*origin).as_micros() as u64, "accepted present");
+        }
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
