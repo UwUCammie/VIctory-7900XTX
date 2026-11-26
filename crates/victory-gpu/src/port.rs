@@ -342,6 +342,23 @@ mod tests {
         if windows::core::Interface::cast::<ID3D12Device13>(&device).is_err() {
             return;
         }
+        reserved_section_round_trip(&device);
+    }
+
+    /// Run on the same D3D12 adapter the renderer selects. This checks the CPU's writes
+    /// through the original views and the GPU's writes through the imported heap.
+    #[test]
+    #[ignore = "requires a D3D12 device that supports opening an existing heap"]
+    fn preferred_adapter_reserved_section_round_trip() {
+        let _turn = crate::indirect::tests::warp_turn();
+        let device = victory_shader::emit::host::create_preferred_device()
+            .expect("the selected adapter must support D3D12");
+        windows::core::Interface::cast::<ID3D12Device13>(&device)
+            .expect("the selected device must support ID3D12Device13");
+        reserved_section_round_trip(&device);
+    }
+
+    fn reserved_section_round_trip(device: &ID3D12Device) {
         const K: usize = 64 << 10;
         // SAFETY (the whole test): the section, placeholder and views made
         // here.
@@ -371,9 +388,9 @@ mod tests {
             }
             let base = hole as u64;
             let (start, len) = (base + K as u64 + 0x40, 5 * K as u64);
-            let placed = place_in(&device, start, len).unwrap_or_else(|e| panic!("not placed: {e:?}"));
+            let placed = place_in(device, start, len).unwrap_or_else(|e| panic!("not placed: {e:?}"));
             assert_eq!(placed.bias, 0x40);
-            let mut rig = crate::inplace::Rig::new(&device).unwrap();
+            let mut rig = crate::inplace::Rig::new(device).unwrap();
             for (i, b) in std::slice::from_raw_parts_mut(start as *mut u8, len as usize).iter_mut().enumerate() {
                 *b = (i * 7 + 3) as u8;
             }
@@ -383,7 +400,7 @@ mod tests {
             assert!(std::slice::from_raw_parts((start + 3 * K as u64) as *const u8, 256).iter().all(|&b| b == 0x5a), "the card's write shows in the title's view");
             // Another buffer in the same stretch: the same region.
             let regions = REGIONS.lock().unwrap().len();
-            let second = place_in(&device, base + 6 * K as u64, 100).unwrap_or_else(|e| panic!("not placed: {e:?}"));
+            let second = place_in(device, base + 6 * K as u64, 100).unwrap_or_else(|e| panic!("not placed: {e:?}"));
             assert_eq!(REGIONS.lock().unwrap().len(), regions, "one region for the stretch");
             assert_eq!(second.bias, 0);
             // The title's views may change under the heap.
