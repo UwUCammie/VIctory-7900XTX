@@ -6,8 +6,8 @@
 //!
 //! The unit of work is a [`Converter`]: bytes in, bytes out, deterministic.
 //! Results are stored in a content-addressed [`Cache`] keyed by converter
-//! id, converter version and input bytes, so re-running the pipeline after
-//! a game update or a converter fix only redoes what changed.
+//! id, converter version, optional key prefix and input bytes. Re-running the
+//! pipeline after a game update or converter fix only redoes what changed.
 
 mod cache;
 
@@ -19,5 +19,10 @@ pub trait Converter: Send + Sync {
     fn id(&self) -> &'static str;
     /// Bump whenever the output for a given input changes.
     fn version(&self) -> u32;
+    /// Configuration bytes hashed immediately before the input. Use a fixed
+    /// prefix length for each converter id and version.
+    fn key_prefix(&self) -> &[u8] {
+        &[]
+    }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>>;
 }

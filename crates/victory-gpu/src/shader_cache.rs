@@ -174,10 +174,11 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     }
 }
 
-/// The cache entry's converter: the build and the container in, the
+/// The cache entry's converter: the container in, the
 /// encoded translation out. `ran` tells a miss from a hit.
 struct Translate<'a, F> {
     translate: F,
+    build: &'a [u8; 32],
     /// The build of the translator, written into the entry.
     source: &'a str,
     ran: AtomicBool,
@@ -188,12 +189,15 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
         "shader.dxil"
     }
     fn version(&self) -> u32 {
-        // The build fingerprint in the input does the versioning.
+        // The build fingerprint in the key prefix does the versioning.
         1
+    }
+    fn key_prefix(&self) -> &[u8] {
+        self.build
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
+        let shader = (self.translate)(input).map_err(anyhow::Error::msg)?;
         Ok(encode(&shader, self.source))
     }
 }
@@ -219,16 +223,16 @@ fn cached_by(
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
     refresh: bool,
 ) -> Result<HostShader, String> {
-    let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
+        build,
         source,
         ran: AtomicBool::new(false),
     };
     let mut old: Option<HostShader> = None;
     for _ in 0..3 {
         let path = cache
-            .get_or_convert(&converter, &input)
+            .get_or_convert(&converter, container)
             .map_err(|e| format!("{e:#}"))?;
         if let Some((shader, made_by)) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
             let ran = converter.ran.load(Ordering::Relaxed);
@@ -481,6 +485,47 @@ mod tests {
                 shift: 5,
             }],
         }
+    }
+
+    #[test]
+    fn reads_an_entry_keyed_with_the_build_and_container_joined() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [7u8; 32];
+        let container = b"synthetic container";
+        // The previous writer hashed the build and container as one input.
+        let old_input = [
+            b"shader.dxil\0".as_slice(),
+            &1u32.to_le_bytes(),
+            &build,
+            container,
+        ]
+        .concat();
+        let key = blake3::hash(&old_input).to_hex();
+        let bucket = dir.path().join(&key[..2]);
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join(&key[2..]), encode(&shader(), SOURCE)).unwrap();
+
+        let hit = cached(
+            &cache,
+            &build,
+            container,
+            |_| panic!("expected a cache hit"),
+            false,
+        );
+        assert_eq!(hit, Ok(shader()));
+        let other = cached(
+            &cache,
+            &[8; 32],
+            container,
+            |input| {
+                assert_eq!(input, container);
+                Ok(shader())
+            },
+            false,
+        );
+        assert_eq!(other, Ok(shader()));
+        assert_eq!(walk(dir.path()).len(), 2);
     }
 
     #[test]

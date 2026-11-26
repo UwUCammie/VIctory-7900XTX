@@ -17,6 +17,7 @@ impl CacheKey {
         h.update(converter.id().as_bytes());
         h.update(&[0]);
         h.update(&converter.version().to_le_bytes());
+        h.update(converter.key_prefix());
         h.update(input);
         CacheKey(h.finalize())
     }
