@@ -334,10 +334,14 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
     p.made.get().is_some_and(|made| made.is_some())
 }
 
-/// At the title's creation of a pipeline: starts it at once if an earlier
-/// run drew with it (during loading, so the world's first frames find it).
+/// At creation, start previously used pipelines. On a cold boot
+/// VICTORY_EARLY_COMPUTE=1 also queues compute pipelines whose dispatches
+/// would wait for them. First use can still promote a queued pipeline.
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    static EARLY_COMPUTE: OnceLock<bool> = OnceLock::new();
+    let cold_compute = p.compute
+        && *EARLY_COMPUTE.get_or_init(|| std::env::var_os("VICTORY_EARLY_COMPUTE").is_some_and(|v| v == "1"));
+    if !p.shaders.is_empty() && (cold_compute || super::library::wanted_early(&p.key)) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
     }
