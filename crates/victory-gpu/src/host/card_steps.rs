@@ -158,12 +158,22 @@ pub(super) fn writers(items: &[Late]) -> Vec<Writer> {
                         });
                     }
                 }
-                out.extend(flight.texture_back_ranges.iter().map(|&(from, to)| Writer {
-                    shadow: None,
-                    from,
-                    to,
-                    copy: false,
-                }));
+                if !flight.texture_back_ranges.is_empty() {
+                    static TRACK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    let track = *TRACK.get_or_init(|| {
+                        let on = std::env::var_os("VICTORY_TEST_CARD_TEXTURE_WRITERS").is_none_or(|value| value != "0");
+                        tracing::info!(enabled = on, "card steps encountered texture copy-back ranges");
+                        on
+                    });
+                    if track {
+                        out.extend(flight.texture_back_ranges.iter().map(|&(from, to)| Writer {
+                            shadow: None,
+                            from,
+                            to,
+                            copy: false,
+                        }));
+                    }
+                }
                 out.extend(flight.own.iter().flat_map(Taken::copied));
             }
             Late::Write(at, _, bytes) => out.push(Writer {
