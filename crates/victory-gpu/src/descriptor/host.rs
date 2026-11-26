@@ -5,6 +5,7 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
+use std::borrow::Cow;
 use std::sync::Mutex;
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -12,6 +13,19 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
+
+/// Return the old reference for retirement. A caller that already owns the
+/// replacement transfers it; a borrowed one needs a reference only on change.
+fn replace_kept<T: Clone, K: PartialEq>(
+    slot: &mut Option<T>,
+    resource: Option<Cow<'_, T>>,
+    identity: impl Fn(&T) -> K,
+) -> Option<T> {
+    if slot.as_ref().map(&identity) == resource.as_deref().map(identity) {
+        return None;
+    }
+    std::mem::replace(slot, resource.map(Cow::into_owned))
+}
 
 /// A set of a heap's slots, a bit for each: no lock (a pass that went through
 /// a set of 70,000 under its lock kept everyone who writes slots waiting for
@@ -2305,7 +2319,7 @@ impl HostHeap {
             };
             if let Some(kept) = make(&view, self.at(slot)) {
                 self.put(slot);
-                self.keep(slot, kept);
+                self.keep(slot, kept.map(Cow::Owned));
                 remade += 1;
             }
         }
@@ -2417,7 +2431,7 @@ impl HostHeap {
                 self.put(index);
                 self.clear_twin(index);
                 LATE[3].fetch_add(u64::from(kept.is_some()), Relaxed);
-                self.keep(index, kept);
+                self.keep(index, kept.map(Cow::Owned));
             }
             stale
         };
@@ -2527,7 +2541,7 @@ impl HostHeap {
                 let was = shown;
                 self.quick_is(f.index, 0);
                 self.made.set(f.index, f.key);
-                self.keep(f.index, kept);
+                self.keep(f.index, kept.map(Cow::Owned));
                 #[cfg(feature = "diagnostics")]
                 if f.late.is_some() && was != 0 {
                     same_bytes(was, f.key);
@@ -2843,7 +2857,7 @@ impl HostHeap {
         }
         self.put(index);
         self.twin_made(index, kept.is_some() && twinned(view));
-        self.keep(index, kept.flatten());
+        self.keep(index, kept.flatten().map(Cow::Owned));
     }
 
     /// Makes slot `index` (a dynamic one) the view the record `words` names,
@@ -2891,11 +2905,7 @@ impl HostHeap {
             } else {
                 self.clear_twin(index);
             }
-            // Most draws find their slot holding it already: no reference
-            // taken only to be let go.
-            if !self.holds(index, made.kept.as_ref()) {
-                self.keep(index, made.kept.clone());
-            }
+            self.keep(index, made.kept.as_ref().map(Cow::Borrowed));
             Some(made.listed)
         })
     }
@@ -2952,32 +2962,20 @@ impl HostHeap {
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's).
-    fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+    fn keep(&self, index: u32, resource: Option<Cow<'_, ID3D12Resource>>) {
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
         let old = {
             use windows::core::Interface;
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
-            // The same again: nothing to retire.
-            if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
-                return;
-            }
-            std::mem::replace(&mut *slot, resource)
+            replace_kept(&mut slot, resource, Interface::as_raw)
         };
         // A running submission may still read the old resource through
         // this slot.
         if let Some(old) = old {
             crate::host::retire_resource(old);
         }
-    }
-
-    /// Whether slot `index` views `resource` (or nothing, with `None`).
-    fn holds(&self, index: u32, resource: Option<&ID3D12Resource>) -> bool {
-        use windows::core::Interface;
-        self.kept.get(index as usize).is_some_and(|slot| {
-            slot.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(Interface::as_raw) == resource.map(Interface::as_raw)
-        })
     }
 
     /// What slot `index` views.
@@ -3013,7 +3011,7 @@ impl HostHeap {
         self.put(index);
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
-        self.keep(index, Some(buffer.clone()));
+        self.keep(index, Some(Cow::Borrowed(buffer)));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
@@ -3056,7 +3054,7 @@ impl HostHeap {
         };
         self.put(index);
         self.clear_twin(index);
-        self.keep(index, Some(buffer.clone()));
+        self.keep(index, Some(Cow::Borrowed(buffer)));
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -3144,7 +3142,7 @@ impl HostHeap {
         self.twin_made(index, twin.is_some());
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep(index, holds.then(|| buffer.clone()));
+        self.keep(index, holds.then_some(Cow::Borrowed(buffer)));
     }
 
     /// Where a descriptor for slot `index` is made, then [`HostHeap::put`]:
@@ -3403,7 +3401,7 @@ impl HostHeap {
                     let kept = neutral_for(&view, self.at(index));
                     self.put(index);
                     self.clear_twin(index);
-                    self.keep(index, kept);
+                    self.keep(index, kept.map(Cow::Owned));
                 }
                 let late = Some(crate::frame::current());
                 let flip = Flip { after, heap: std::ptr::from_ref(self) as usize, index, handle, key, late };
@@ -3431,7 +3429,7 @@ impl HostHeap {
                 self.put(index);
             }
             self.twin_made(index, kept.is_some() && twinned(&view));
-            self.keep(index, kept.flatten());
+            self.keep(index, kept.flatten().map(Cow::Owned));
             self.quick_is(index, if later { 0 } else { key });
             drop(held);
             self.unmake_stale(index, stale);
@@ -5020,6 +5018,34 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn borrowed_descriptor_references_are_taken_only_on_change() {
+        use std::borrow::Cow;
+        use std::cell::Cell;
+        struct Reference<'a>(u32, &'a Cell<u32>);
+        impl Clone for Reference<'_> {
+            fn clone(&self) -> Self {
+                self.1.set(self.1.get() + 1);
+                Self(self.0, self.1)
+            }
+        }
+        let clones = Cell::new(0);
+        let a = Reference(1, &clones);
+        let b = Reference(2, &clones);
+        let mut slot = None;
+        let key = |r: &Reference<'_>| r.0;
+        assert!(super::replace_kept(&mut slot, Some(Cow::Borrowed(&a)), key).is_none());
+        assert_eq!(clones.get(), 1);
+        assert!(super::replace_kept(&mut slot, Some(Cow::Borrowed(&a)), key).is_none());
+        assert_eq!(clones.get(), 1);
+        assert_eq!(super::replace_kept(&mut slot, Some(Cow::Borrowed(&b)), key).unwrap().0, 1);
+        assert_eq!(clones.get(), 2);
+        assert_eq!(super::replace_kept(&mut slot, Some(Cow::Owned(a)), key).unwrap().0, 2);
+        assert_eq!(clones.get(), 2);
+        assert_eq!(super::replace_kept(&mut slot, None, key).unwrap().0, 1);
+        assert!(super::replace_kept(&mut slot, None, key).is_none());
+    }
+
     use super::*;
 
     /// Every host sampler heap backs all 2,048 hardware descriptors and
