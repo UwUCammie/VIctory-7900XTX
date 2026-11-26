@@ -18,13 +18,13 @@ use crate::host::host;
 /// replacement transfers it; a borrowed one needs a reference only on change.
 fn replace_kept<T: Clone, K: PartialEq>(
     slot: &mut Option<T>,
-    resource: Option<Cow<'_, T>>,
+    resource: &mut Option<Cow<'_, T>>,
     identity: impl Fn(&T) -> K,
 ) -> Option<T> {
     if slot.as_ref().map(&identity) == resource.as_deref().map(identity) {
         return None;
     }
-    std::mem::replace(slot, resource.map(Cow::into_owned))
+    std::mem::replace(slot, resource.take().map(Cow::into_owned))
 }
 
 /// A set of a heap's slots, a bit for each: no lock (a pass that went through
@@ -2962,14 +2962,14 @@ impl HostHeap {
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's).
-    fn keep(&self, index: u32, resource: Option<Cow<'_, ID3D12Resource>>) {
+    fn keep(&self, index: u32, mut resource: Option<Cow<'_, ID3D12Resource>>) {
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
         let old = {
             use windows::core::Interface;
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
-            replace_kept(&mut slot, resource, Interface::as_raw)
+            replace_kept(&mut slot, &mut resource, Interface::as_raw)
         };
         // A running submission may still read the old resource through
         // this slot.
@@ -5034,16 +5034,20 @@ mod tests {
         let b = Reference(2, &clones);
         let mut slot = None;
         let key = |r: &Reference<'_>| r.0;
-        assert!(super::replace_kept(&mut slot, Some(Cow::Borrowed(&a)), key).is_none());
+        assert!(super::replace_kept(&mut slot, &mut Some(Cow::Borrowed(&a)), key).is_none());
         assert_eq!(clones.get(), 1);
-        assert!(super::replace_kept(&mut slot, Some(Cow::Borrowed(&a)), key).is_none());
+        assert!(super::replace_kept(&mut slot, &mut Some(Cow::Borrowed(&a)), key).is_none());
         assert_eq!(clones.get(), 1);
-        assert_eq!(super::replace_kept(&mut slot, Some(Cow::Borrowed(&b)), key).unwrap().0, 1);
+        assert_eq!(super::replace_kept(&mut slot, &mut Some(Cow::Borrowed(&b)), key).unwrap().0, 1);
         assert_eq!(clones.get(), 2);
-        assert_eq!(super::replace_kept(&mut slot, Some(Cow::Owned(a)), key).unwrap().0, 2);
+        assert_eq!(super::replace_kept(&mut slot, &mut Some(Cow::Owned(a)), key).unwrap().0, 2);
         assert_eq!(clones.get(), 2);
-        assert_eq!(super::replace_kept(&mut slot, None, key).unwrap().0, 1);
-        assert!(super::replace_kept(&mut slot, None, key).is_none());
+        // An unused owned reference can be dropped by the caller after unlocking.
+        let mut repeated = Some(Cow::Owned(Reference(1, &clones)));
+        assert!(super::replace_kept(&mut slot, &mut repeated, key).is_none());
+        assert!(repeated.is_some());
+        assert_eq!(super::replace_kept(&mut slot, &mut None, key).unwrap().0, 1);
+        assert!(super::replace_kept(&mut slot, &mut None, key).is_none());
     }
 
     use super::*;
