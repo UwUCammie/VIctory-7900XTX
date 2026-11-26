@@ -157,6 +157,20 @@ pub fn helper_own() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_OWN").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_AMD_PICKS=1` (fx-xtx2, local; off by default): the MIMG sample
+/// variants with an offset word (`_o`) beside clamp, bias, level, compare or
+/// gradients (`image_sample_cl_o` ...), with a constant offset word made
+/// immediate offsets for every sample (VItoriaBr 6dcd8cd3). The other
+/// fx-w3-stab picks are already in this tree, always on (integer-target
+/// blending, quad reads reaching helper lanes), or on by default
+/// (`VICTORY_HELPER_OWN`, screen-pass workers/budget `VICTORY_SCREEN_WAIT_MS`).
+/// Part of the translation fingerprint (its name is a `VICTORY_*` string of
+/// this crate).
+pub fn amd_picks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_AMD_PICKS").is_some_and(|v| v == "1"))
+}
+
 /// Which of a translated program's group barriers wait for the whole
 /// group (`GroupMemoryBarrierWithGroupSync`); the others keep their memory
 /// fence and lose the wait. A wait that some thread of the group never

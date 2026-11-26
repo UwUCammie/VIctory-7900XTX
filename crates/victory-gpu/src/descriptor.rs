@@ -1435,6 +1435,18 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     }
 }
 
+/// The view at `handle` read with a guarded copy: a slot a material record
+/// names may lie in a reserved, uncommitted part of a heap
+/// (`VICTORY_MATERIAL_DEMAND`, from DexNom b8ff22e).
+pub(crate) fn checked_view(handle: u64) -> Option<View> {
+    let mut bytes = [0u8; 12];
+    if handle == 0 || !crate::host::read_into(handle as *const u8, &mut bytes) {
+        return None;
+    }
+    let word = |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+    (word(0) == VIEW_TAG).then(|| view_at(word(4), word(8))).flatten()
+}
+
 /// The words of the record at `handle`, if they are a view's.
 pub(crate) fn record_at(handle: u64) -> Option<[u32; 3]> {
     if handle == 0 {

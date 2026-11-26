@@ -2414,6 +2414,9 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// Work run once the list has run, after its read-backs
+    /// (`HostList::defer_after`; `VICTORY_MATERIAL_DEMAND`).
+    after: Vec<Box<dyn Fn() + Send>>,
 }
 
 impl Deferred {
@@ -4037,6 +4040,12 @@ fn read_backs(list: &HostList) {
                 buffer.Unmap(0, None);
             }
         }
+    }
+    // Work asked for once the list has run (`HostList::defer_after`):
+    // taken out first, so that it runs once and may record nothing here.
+    let after = std::mem::take(&mut list.deferred().after);
+    for work in after {
+        work();
     }
 }
 
@@ -5754,20 +5763,49 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
-            let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
-            for list in runs {
-                for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && shadow.asked_ahead()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+            let ranges: Vec<(usize, usize)> = if ask_sparse() {
+                // The refreshed ranges themselves, merged where less than
+                // `ASK_GAP` apart: the span from a big copy's lowest to its
+                // highest refresh had the kernel walk all of it (1,620 MB a
+                // frame for 13 MB written in the opening cutscene, run
+                // 20261125-231237). A range left out is no refresh's, and
+                // what a refresh needs and was not asked here `writes` asks.
+                let mut all: Vec<(usize, usize)> = Vec::new();
+                for list in runs {
+                    for step in &list.deferred().copies {
+                        if let Step::Refresh(shadow, address, len) = step
+                            && shadow.asked_ahead()
+                            && *len > 0
+                        {
+                            all.push((*address, *address + *len));
+                        }
                     }
                 }
-            }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+                all.sort_unstable();
+                let mut merged: Vec<(usize, usize)> = Vec::with_capacity(all.len());
+                for (a, b) in all {
+                    match merged.last_mut() {
+                        Some(last) if a <= last.1.saturating_add(ASK_GAP) => last.1 = last.1.max(b),
+                        _ => merged.push((a, b)),
+                    }
+                }
+                merged
+            } else {
+                let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
+                for list in runs {
+                    for step in &list.deferred().copies {
+                        if let Step::Refresh(shadow, address, len) = step
+                            && shadow.asked_ahead()
+                        {
+                            let span = spans
+                                .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                                .or_insert((*address, *address + *len));
+                            *span = (span.0.min(*address), span.1.max(*address + *len));
+                        }
+                    }
+                }
+                spans.into_values().collect()
+            };
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
@@ -7129,6 +7167,12 @@ impl HostList {
         }
     }
 
+    /// Runs `work` once the list has run, after its read-backs
+    /// (`VICTORY_MATERIAL_DEMAND`: material records read back).
+    pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().after.push(Box::new(work));
+    }
+
     /// A read back: once the list has run, `rows` rows of `row` bytes go
     /// from `buffer` (rows 256-byte pitched, see `PlacedFootprint::host_rows`)
     /// to title memory at `dst`, pitched `pitch`. The buffer lives until
@@ -7767,6 +7811,8 @@ fn split_line(frames: f64) {
         h[2],
         aside::WAITED.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames,
     );
+    crate::vq::line(frames);
+    crate::watch::holes_line(frames);
 }
 
 /// Whether a submission's refreshes of host copies run on several threads,
@@ -8491,7 +8537,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
 /// cache the query across copies: the title may remap the same address.
 fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS,
     };
     let mut offset = 0;
     while offset < len {
@@ -8500,7 +8546,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         let remaining = len - offset;
         // SAFETY: the query inspects an address and fills a local structure.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
+        let size = crate::vq::query(crate::vq::Site::ReadSparse, at as usize, &mut info);
         let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
             .saturating_sub(at as usize).min(remaining);
         if size != size_of_val(&info) || n == 0 {
@@ -8553,6 +8599,17 @@ fn zero(to: *mut u8, n: usize) {
     // SAFETY: inside the destination, which is mapped.
     unsafe { to.write_bytes(0, n) };
 }
+
+/// Whether a submission's one write-watch asking (`VICTORY_ASK_ONCE`) asks
+/// about the refreshed ranges merged across gaps under [`ASK_GAP`], not the
+/// span of each copy's refreshes (`VICTORY_ASK_SPARSE=1`; off by default).
+fn ask_sparse() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_SPARSE").is_some_and(|v| v == "1"))
+}
+
+/// [`ask_sparse`]: refreshed ranges less than this apart are asked as one.
+const ASK_GAP: usize = 1 << 20;
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.

@@ -186,6 +186,9 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && constrained && kind & MEM_COMMIT == 0 && flags & ADDRESS_32BIT != 0 {
         LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).push((at as usize, size));
     }
+    if !at.is_null() && placeholder {
+        victory_gpu::title_placeholders_reserved(at as usize, size);
+    }
     note_protection(asked, kind, flags, at as usize, size);
     at
 }
@@ -366,6 +369,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            victory_gpu::query_cache_gone(address as usize, 0);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }

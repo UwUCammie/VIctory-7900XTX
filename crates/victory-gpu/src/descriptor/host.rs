@@ -232,6 +232,9 @@ pub(crate) struct HostHeap {
     /// another's view made stale stays, which says only "may"): a write of
     /// any other view needs nothing of `placed` ([`spans_quick`]).
     spanned: Slots,
+    /// Texture slots named by material records the card read
+    /// (`VICTORY_MATERIAL_DEMAND=1`, [`crate::material_demand`]).
+    pub(crate) material_demand: crate::material_demand::Mailbox,
 }
 
 /// Whether a slot's write of no placed texture view leaves `placed` alone
@@ -1746,6 +1749,7 @@ impl HostHeap {
                 spans
             },
             spanned: Slots::new((count + extra) as usize),
+            material_demand: Default::default(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1916,6 +1920,75 @@ impl HostHeap {
             (if max == 0 { Due::default() } else { textures.all_due(frame) }, textures.census(frame))
         };
         (TextureQueue::in_order(due, max), census)
+    }
+
+    /// The queue's write count (`VICTORY_MATERIAL_DEMAND`): an observation
+    /// promotes only a queue entry written no later than it was read.
+    pub(crate) fn material_write_stamp(&self) -> u64 {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).writes
+    }
+
+    /// Title slot `index`, which a material record the card read names
+    /// (`VICTORY_MATERIAL_DEMAND`, after DexNom b8ff22e): its queue entry
+    /// (slot, write) if it is due, to go first in this frame's pass. A slot
+    /// not in the queue whose host slot is null is put back in it, due now,
+    /// only for a typed block-compressed 2D texture view whose memory is all
+    /// mapped and whose span no other slot's view holds (a newer texture
+    /// there made it stale: it is not brought back over that one).
+    pub(crate) fn demand_material_texture(&self, heap: &super::Heap, index: u32, stamp: u64, frame: u64) -> Option<(u32, u64)> {
+        if self.sampler || index >= self.count {
+            return None;
+        }
+        let handle = heap.handle(index)?;
+        let View::Placed(false, resource, desc) = super::checked_view(handle)? else {
+            return None;
+        };
+        if resource[0] == 1 {
+            return None;
+        }
+        let key = self.made.get(index)?;
+        {
+            let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(w) = textures.slots.get(&index) {
+                return (w.due <= frame && w.write <= stamp).then_some((index, w.write));
+            }
+        }
+        let typed_bc = matches!(resource[8], 71 | 72 | 74 | 75 | 77 | 78 | 80 | 81 | 83 | 84 | 95 | 96 | 98 | 99);
+        if key != 0
+            || resource[0] != 3
+            || resource[7] as u16 != 1
+            || !typed_bc
+            || resource[9] != 1
+            || resource[12] & 15 != 0
+            || desc[0] != resource[8]
+            || desc[1] != 4
+            || desc[4] >= resource[7] >> 16
+            || self.tabled_lately(index, frame)
+        {
+            return None;
+        }
+        let start = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+        let len = crate::resource::placed_bytes(&resource)?;
+        let end = start.checked_add(len)?;
+        if start == 0 || len == 0 || crate::texture::mapped_bytes(start as *const u8, usize::try_from(len).ok()?) != len {
+            return None;
+        }
+        if !self.placed.lock().unwrap_or_else(|e| e.into_inner()).overlapping(start, end).is_empty() {
+            return None;
+        }
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        if textures.slots.contains_key(&index) {
+            return None;
+        }
+        textures.written(index, frame, frame, false);
+        let write = textures.slots.get(&index)?.write;
+        drop(textures);
+        static REVIVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = REVIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 16 || n.is_power_of_two() {
+            tracing::info!(frame, slot = index, first_mip = desc[4], bytes = len, revived = n, format = desc[0], "material demand: a null texture a material the card read names is queued again");
+        }
+        Some((index, write))
     }
 
     /// A number that changes when a slot is written or made due anew, and
@@ -3351,8 +3424,8 @@ impl HostHeap {
 
     /// Whether host slot `index` shows `buffer`; `None` if it shows no
     /// resource (diagnostics: a buffer view's slot must show the host copy
-    /// that is brought up to date for it).
-    #[cfg(feature = "diagnostics")]
+    /// that is brought up to date for it). (Also `VICTORY_MATERIAL_DEMAND`:
+    /// the material record read back is the one the slot shows.)
     pub(crate) fn shows(&self, index: u32, buffer: &ID3D12Resource) -> Option<bool> {
         let shown = self.kept_in(index)?;
         Some(windows::core::Interface::as_raw(&shown) == windows::core::Interface::as_raw(buffer))

@@ -1076,6 +1076,10 @@ fn frame_ends() {
         if switch == "VICTORY_ASYNC_SUBMIT" && was && !will {
             behind::leave();
         }
+        if switch == "VICTORY_SPARSE_RANGES" {
+            let _ = will;
+            crate::draw::sparse_phase_line(was);
+        }
     });
     if let Some(on) = crate::ab::pick("VICTORY_LANE_CORE") {
         static WAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

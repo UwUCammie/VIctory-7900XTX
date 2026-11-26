@@ -105,6 +105,22 @@ struct Last {
     /// first checks, and after the hash found a change the guard had not
     /// seen ([`hot_textures`]). 0: not checked under the guard yet.
     hot_until: u64,
+    /// The frame (+1; 0: never) this texture last asked the write watch or
+    /// the guards ([`ask_once`]).
+    asked_frame: u64,
+}
+
+/// Whether a texture asks the write watch / its guards at most once a
+/// frame (`VICTORY_TEXTURE_ASK_ONCE=1`; off by default). Each submission
+/// that uses a texture asked again over its whole range: in the opening
+/// cutscene 233 askings a frame over 1620 MB found 3,454 pages written and
+/// cost 74 ms a frame of texture threads' time (run 20261125-231237),
+/// most of it under Wine's address-space lock that the submitting thread
+/// waits for too. Once a frame, a texture the title writes in the middle
+/// of a frame is seen at the next frame's first use (one frame late).
+fn ask_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ASK_ONCE").is_some_and(|v| v == "1"))
 }
 
 /// Frames a guarded texture is hashed at every check from its first check,
@@ -1187,6 +1203,15 @@ impl Staging {
         if alone && last.hash.is_some() {
             return 0;
         }
+        // Asked already this frame ([`ask_once`]): as it was then. (A
+        // texture never brought up yet, or only partly mapped, goes on.)
+        if !alone && ask_once() && last.asked != 0 && last.partial.is_none() {
+            let frame = crate::frame::current() + 1;
+            if last.asked_frame == frame {
+                return 0;
+            }
+            last.asked_frame = frame;
+        }
         if !alone && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
@@ -1662,14 +1687,14 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
 }
 
 fn committed_by_query(at: *const u8, len: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION};
     let mut p = at as usize;
     let end = p + len;
     while p < end {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        let n = crate::vq::query(crate::vq::Site::CommittedByQuery, p, &mut info);
         if n == 0 || info.State != MEM_COMMIT {
             return false;
         }
@@ -1685,7 +1710,7 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
 /// answer is none without a look at the pages between (two queries for the
 /// slots whose texture is away, which are asked again and again).
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION};
     if len == 0 {
         return 0;
     }
@@ -1736,7 +1761,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        let n = crate::vq::query(crate::vq::Site::MappedBytes, p, &mut info);
         let next = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
         if n == 0 || next <= p {
             break;

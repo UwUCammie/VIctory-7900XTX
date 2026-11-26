@@ -853,6 +853,53 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
+/// Whether the heap pass refreshes the union of the picked views' ranges
+/// per host copy rather than the one span from the lowest to the highest
+/// (`VICTORY_SPARSE_RANGES=1`; may change by `VICTORY_AB`). The span reached
+/// over the title's streaming pools, holes and all (placeholders it maps
+/// pages into block by block), and each refresh guarded, asked about and
+/// walked all of it.
+pub(crate) fn sparse_ranges() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // (`crate::ab` is in diagnostics builds only.)
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_SPARSE_RANGES") {
+        return on;
+    }
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SPARSE_RANGES").is_some_and(|v| v == "1"))
+}
+
+/// Ranges less than this apart are refreshed as one.
+const SPARSE_GAP: u64 = 64 << 10;
+
+/// Diagnostics since the last A/B phase: bytes of the copies' spans, bytes
+/// refreshed (the union with `VICTORY_SPARSE_RANGES`, else the spans),
+/// refreshes, passes.
+#[cfg(feature = "diagnostics")]
+static SPARSE: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// An A/B phase is over (`VICTORY_SPARSE_RANGES` among the switches): what
+/// its passes refreshed and asked.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn sparse_phase_line(was: bool) {
+    let s: Vec<u64> = SPARSE.iter().map(|n| n.swap(0, Ordering::Relaxed)).collect();
+    let passes = s[3].max(1) as f64;
+    let (questions, prep_ms, frames) = crate::watch::phase_taken();
+    let f = frames.max(1) as f64;
+    tracing::info!(
+        "A/B sparse ranges phase ({}): {} passes, per pass span {:.0} MB, refreshed {:.0} MB in {:.0} refreshes; per frame {:.0} questions about holes, \
+         {:.2} ms asking the guards and write watch (all threads), {} frames",
+        if was { "union" } else { "envelope" },
+        s[3],
+        s[0] as f64 / passes / 1048576.0,
+        s[1] as f64 / passes / 1048576.0,
+        s[2] as f64 / passes,
+        questions as f64 / f,
+        prep_ms / f,
+        frames,
+    );
+}
+
 /// The pass over the buffer views of `heap` that shaders pick by index
 /// ([`State::heap_buffers`]): their host slots are made, and the host copies
 /// they show are to be refreshed.
@@ -953,6 +1000,9 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let looked = std::time::Instant::now();
     // Per host copy, the span its picked views cover.
     let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Default::default();
+    // And with `VICTORY_SPARSE_RANGES`, the views' ranges themselves.
+    let sparse = sparse_ranges();
+    let mut pieces: crate::host::ByCopy<Vec<(u64, u64)>> = Default::default();
     let mut views = 0u32;
     for (shadow, from, to) in ranges.ranges() {
         views += 1;
@@ -960,8 +1010,36 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
         span.1 = span.1.min(*from);
         span.2 = span.2.max(*to);
+        if sparse {
+            pieces.entry(key).or_default().push((*from, *to));
+        }
     }
     let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+    // The union of the views' ranges, pieces less than a block apart
+    // joined: what lies between is read by no view.
+    for list in pieces.values_mut() {
+        list.sort_unstable();
+        let mut joined: Vec<(u64, u64)> = Vec::with_capacity(list.len());
+        for &(from, to) in list.iter() {
+            match joined.last_mut() {
+                Some(last) if from <= last.1.saturating_add(SPARSE_GAP) => last.1 = last.1.max(to),
+                _ => joined.push((from, to)),
+            }
+        }
+        *list = joined;
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        SPARSE[0].fetch_add(bytes, Ordering::Relaxed);
+        let (union, count) = if sparse {
+            (pieces.values().flatten().map(|(f, t)| t - f).sum::<u64>(), pieces.values().map(Vec::len).sum::<usize>() as u64)
+        } else {
+            (bytes, spans.len() as u64)
+        };
+        SPARSE[1].fetch_add(union, Ordering::Relaxed);
+        SPARSE[2].fetch_add(count, Ordering::Relaxed);
+        SPARSE[3].fetch_add(1, Ordering::Relaxed);
+    }
     // Memory that is not write-watched is copied whole by every refresh.
     // It was once refreshed only every 120 frames (unmapped pages read
     // one by one cost 14 GB a frame in run 11, before they were
@@ -985,6 +1063,12 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
                 continue;
             }
             next_unwatched.insert(id, (frame, *from, *to));
+        }
+        if sparse && let Some(list) = pieces.get(&(std::sync::Arc::as_ptr(shadow) as usize)) {
+            for &(from, to) in list {
+                found.push((shadow.clone(), from, to.min(from + shadow.left(from))));
+            }
+            continue;
         }
         found.push((shadow.clone(), *from, (*to).min(*from + shadow.left(*from))));
     }
@@ -1681,6 +1765,25 @@ impl State {
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
+                // `VICTORY_MATERIAL_DEMAND=1` (DexNom b8ff22e): a material
+                // shader's record, read back from the buffer it reads, names
+                // the texture slots to bring up to date first.
+                if !compute
+                    && crate::material_demand::enabled()
+                    && let Some(fields) = crate::material_demand::fields(&stage.shader.hash)
+                    && t.host.user_data.iter().any(|u| u.index == 8 && u.root == RootType::Table && u.slot == 0)
+                    && let Some(u) = t.host.user_data.iter().find(|u| u.index == 14 && u.root == RootType::Constants)
+                    && let Some(Root::Constants(words)) = self.roots_ref(false).get(usize::from(u.slot))
+                    && let Some(&record) = words.get(u.dword as usize)
+                    && let Some(Root::Table(table)) = self.roots_ref(false).first()
+                    && let Some(heap) = self.heap_of(*table)
+                    && !heap.samplers()
+                    && let Some(&bound) = values.get(8)
+                    && Some(u64::from(bound)) == table.checked_sub(heap.start)
+                    && crate::material_demand::wants(heap, record, fields)
+                {
+                    crate::material_demand::record(list, heap, *table, record, fields);
+                }
                 #[cfg(feature = "diagnostics")]
                 {
                     self.user.clear();
@@ -2318,7 +2421,13 @@ impl State {
             host.texture_slots_waiting(frame);
         }
         let baking = crate::texture::BAKING.get();
+        // `VICTORY_MATERIAL_DEMAND=1`: the slots material records the card
+        // read name go first (`crate::material_demand`).
+        let wanted = crate::material_demand::enabled().then(|| host.material_demand.take(heap, host, frame));
         let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
+        if let Some(wanted) = wanted {
+            crate::material_demand::promote(&mut due, &wanted, frame);
+        }
         // (Those that are due later after all that are due.)
         let on_time = due.len();
         if baking {

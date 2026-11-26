@@ -77,6 +77,8 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
+mod material_demand;
+#[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
 mod tiles;
@@ -97,6 +99,10 @@ mod upload;
 mod watch;
 #[cfg(windows)]
 mod texback;
+#[cfg(windows)]
+mod vq;
+#[cfg(windows)]
+pub use vq::{came as query_cache_came, gone as query_cache_gone};
 
 #[cfg(windows)]
 pub use host::on_failure;
@@ -117,7 +123,7 @@ pub fn frame_phase() -> u32 {
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
+    kernel_writing, title_memory_allocated, title_memory_freed, title_placeholders_reserved, title_memory_reading, title_memory_remapped,
     title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
     writing as kernel_will_write,
 };

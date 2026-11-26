@@ -11581,8 +11581,18 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
             return Ok(());
         }
-        let has_cl = name.ends_with("_cl");
+        // `VICTORY_AMD_PICKS=1` (VItoriaBr 6dcd8cd3): the sample variants
+        // with an offset word beside clamp, bias, level, compare or
+        // gradients (`image_sample_cl_o` ...). Without it they stay refused.
+        let picks = super::amd_picks();
+        let has_cl = if picks { name.split('_').any(|t| t == "cl") } else { name.ends_with("_cl") };
         let (op, sample) = match name {
+            "image_sample_cl_o" if picks => (60, true),
+            "image_sample_l_o" if picks => (62, true),
+            "image_sample_b_o" | "image_sample_b_cl_o" if picks => (61, true),
+            "image_sample_c_lz_o" if picks => (65, true),
+            "image_sample_d_o" | "image_sample_d_cl_o" if picks => (63, true),
+            "image_sample_c_o" | "image_sample_c_cl_o" if picks && self.s.pixel => (64, true),
             "image_sample" | "image_sample_o" | "image_sample_cl" => (60, true),
             "image_sample_lz" | "image_sample_l" | "image_sample_lz_o" => (62, true),
             "image_sample_b" | "image_sample_b_cl" => (61, true),
@@ -11758,7 +11768,35 @@ impl<'a> Lower<'a> {
             for o in os.iter_mut().take(offsets) {
                 *o = zero;
             }
-            if offset_word && offsets > 0 {
+            if offset_word && offsets > 0 && picks {
+                // `VICTORY_AMD_PICKS=1` (VItoriaBr 6dcd8cd3): the offset word
+                // is a whole 32-bit register even with a16: signed 6-bit
+                // fields at bits 0, 8 and 16 (x, y, z). DXIL's sampling ops
+                // want immediate offsets in -8..=7, gathers take any: a
+                // constant word becomes immediates for every op.
+                let w = addr_u32(self, 0)?;
+                let imm = self.s.m.int_value(w).and_then(|w| {
+                    let w = w as u32;
+                    let field = |k: usize| {
+                        let x = (w >> (8 * k) & 0x3F) as i32;
+                        if x >= 32 { x - 64 } else { x }
+                    };
+                    let fields = [field(0), field(1), field(2)];
+                    (op == 73 || fields[..offsets].iter().all(|x| (-8..=7).contains(x))).then_some(fields)
+                });
+                if let Some(fields) = imm {
+                    for (k, o) in os.iter_mut().enumerate().take(offsets) {
+                        *o = self.s.m.i32(fields[k] as u32);
+                    }
+                } else {
+                    for (k, at) in [(0, 26), (1, 18), (2, 10)].into_iter().take(offsets) {
+                        let left = self.s.m.i32(at);
+                        let t = self.s.m.bin(c, Bin::Shl, w, left);
+                        let k26 = self.s.m.i32(26);
+                        os[k] = self.s.m.bin(c, Bin::AShr, t, k26);
+                    }
+                }
+            } else if offset_word && offsets > 0 {
                 let w = addr_val(self, 0)?;
                 for (k, at) in [(0, 26), (1, 18)].into_iter().take(offsets.min(2)) {
                     // Bits at..at+5 sign-extended: shift up, then down.
@@ -11960,7 +11998,7 @@ impl<'a> Lower<'a> {
                     call_sample(self, name, op, &args, &mut gathered)
                 }
                 62 => {
-                    let lod = if name == "image_sample_l" {
+                    let lod = if matches!(name, "image_sample_l" | "image_sample_l_o") {
                         let x = addr_packed(self, coord_base, coords)?;
                         to_float(self, x)
                     } else {
