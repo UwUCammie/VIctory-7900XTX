@@ -330,6 +330,65 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
     }
 }
 
+/// Other shapes a program's control flow can be written in, as bits. Every
+/// shape computes the same values; they differ only in the blocks and
+/// branches the host's DXIL-to-SPIR-V converter is given. vkd3d-proton's
+/// converter (dxil-spirv) recurses without bound on the control flow of a
+/// few programs (a loop header with several back edges, in a program with
+/// lane shuffles: `flatten_subgroup_shuffles`, then the dominator
+/// recursion), and the thread compiling the host pipeline overflows its
+/// stack (issue #111). The pipeline maker in victory-gpu translates such a
+/// program again in these shapes, in [`CFG_FORM_RETRIES`] order, when a host
+/// compile thread died that way (`VICTORY_PIPE_FIX=1` there).
+/// - [`CFG_STOP_PER_LOOP`]: a loop stopped at the iteration limit leaves
+///   through a return block of its own, not one shared by every loop.
+/// - [`CFG_ONE_LATCH`]: one back edge per loop header, from a block with no
+///   other ([`crate::ir`]'s `single_latches`), the latch DXC would make.
+///
+/// 0 (the usual shape, unchanged) except inside [`with_cfg_form`]. The
+/// retries do not go through the shader cache, so it is not part of the
+/// translation fingerprint.
+pub fn cfg_form() -> u32 {
+    FORM.with(std::cell::Cell::get)
+}
+
+/// See [`cfg_form`].
+pub const CFG_STOP_PER_LOOP: u32 = 8;
+/// See [`cfg_form`].
+pub const CFG_ONE_LATCH: u32 = 16;
+/// Every bit [`cfg_form`] knows.
+pub const CFG_ALL: u32 = CFG_STOP_PER_LOOP | CFG_ONE_LATCH;
+/// The shapes the pipeline maker tries, in order, for a program whose host
+/// compile died: one latch per loop (the known cause), then with the loop
+/// stops apart too.
+pub const CFG_FORM_RETRIES: [u32; 2] = [CFG_ONE_LATCH, CFG_ONE_LATCH | CFG_STOP_PER_LOOP];
+
+thread_local! {
+    static FORM: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `f` (a translation) with [`cfg_form`] `form` on this thread.
+pub fn with_cfg_form<R>(form: u32, f: impl FnOnce() -> R) -> R {
+    struct Reset(u32);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FORM.with(|c| c.set(self.0));
+        }
+    }
+    let _reset = Reset(FORM.with(|c| c.replace(form & CFG_ALL)));
+    f()
+}
+
+/// The program in the IR shape `form` asks for (the loop stops are the
+/// lowering's); unchanged where a form changes nothing.
+fn reshaped(p: crate::ir::Program, form: u32) -> crate::ir::Program {
+    if form & CFG_ONE_LATCH != 0 {
+        crate::ir::single_latches(&p).unwrap_or(p)
+    } else {
+        p
+    }
+}
+
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
@@ -429,6 +488,9 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
     let p = crate::spill::build(&native)?;
+    // The program in another control-flow shape when one is asked for
+    // ([`cfg_form`]; 0: unchanged).
+    let p = reshaped(p, cfg_form());
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);

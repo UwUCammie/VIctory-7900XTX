@@ -786,6 +786,79 @@ fn early_out_continuation(p: &Program, b: usize) -> Option<usize> {
     }
 }
 
+/// The program with one back edge per loop: where a loop header is
+/// reached back from several blocks (a loop with several `continue`s), or
+/// a block branches back to two headers at once, those back edges go to a
+/// new empty block that jumps to the header (the latch DXC would make).
+/// The new block has no instructions, so behaviour is unchanged.
+/// vkd3d-proton's DXIL converter (dxil-spirv) takes one back edge per
+/// header for granted before it merges the others: on such a loop in a
+/// program with lane shuffles its first dominator pass
+/// (`flatten_subgroup_shuffles`, before the structurizer's own merge)
+/// recurses without end, and the host compile overflows its stack
+/// (issue #111: the ray-traced shadow passes among them). `None` if every header
+/// already has a single back edge from a block with no other.
+pub(crate) fn single_latches(p: &Program) -> Option<Program> {
+    let order = reverse_postorder(&p.blocks);
+    let mut index = vec![usize::MAX; p.blocks.len()];
+    for (i, &b) in order.iter().enumerate() {
+        index[b] = i;
+    }
+    // Back edges (to a block no later in reverse postorder), by header, and
+    // how many each source has.
+    let mut back: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
+    let mut sources: std::collections::HashMap<usize, usize> = Default::default();
+    for &b in &order {
+        let mut succs = p.blocks[b].exit.successors();
+        succs.dedup();
+        for s in succs {
+            if index[s] <= index[b] {
+                back.entry(s).or_default().push(b);
+                *sources.entry(b).or_default() += 1;
+            }
+        }
+    }
+    let mut blocks = p.blocks.clone();
+    let mut any = false;
+    for (header, from) in back {
+        if from.len() < 2 && from.iter().all(|q| sources[q] < 2) {
+            continue;
+        }
+        let latch = blocks.len();
+        blocks.push(Block {
+            offset: blocks[from[0]].offset,
+            preds: Vec::new(),
+            phis: Vec::new(),
+            insts: Vec::new(),
+            exit: Exit::Jump(header),
+        });
+        for q in from {
+            match &mut blocks[q].exit {
+                Exit::Jump(t) => *t = latch,
+                Exit::Branch { taken, not_taken } => {
+                    if *taken == header {
+                        *taken = latch;
+                    }
+                    if *not_taken == header {
+                        *not_taken = latch;
+                    }
+                }
+                Exit::End | Exit::Indirect => unreachable!("a back edge without a successor"),
+            }
+        }
+        any = true;
+    }
+    if !any {
+        return None;
+    }
+    for block in &mut blocks {
+        block.phis.clear();
+    }
+    link(&mut blocks);
+    split_irreducible(&mut blocks).ok()?;
+    Some(rename(blocks, p.wave64, p.vgprs))
+}
+
 /// As [`without_early_outs`], and also without the branches that only skip a
 /// region when no lane is left for it: an `s_cbranch_execz` whose target is
 /// where the skipped code ends up anyway (`if (c) { ... }` with nothing
@@ -2219,5 +2292,75 @@ mod tests {
         assert_eq!(header.insts[0].read(Reg::S(2)), Some(lp_s2));
         assert_eq!(exit.insts[0].read(Reg::S(1)), Some(next_s1));
         assert_eq!(exit.insts[0].read(Reg::S(2)), Some(lp_s2));
+    }
+
+    /// A loop closed by two back edges (two `continue`s) gets one
+    /// latch, an empty block that jumps to the header; values still flow
+    /// through the header's phis; a loop with one back edge is left alone.
+    #[test]
+    fn a_loop_with_two_back_edges_gets_one_latch() {
+        let p = build_words(
+            &[
+                0xBE80_0380, // 0: s_mov_b32 s0, 0
+                0x8000_8100, // 4: s_add_u32 s0, s0, 1      (header)
+                0xBF06_8200, // 8: s_cmp_eq_u32 s0, 2
+                0xBF85_FFFD, // c: s_cbranch_scc1 -> 4      (back edge 1)
+                0x8000_8100, // 10: s_add_u32 s0, s0, 1
+                0xBF07_8400, // 14: s_cmp_lg_u32 s0, 4
+                0xBF85_FFFA, // 18: s_cbranch_scc1 -> 4     (back edge 2)
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let back = |p: &Program| {
+            let order = reverse_postorder(&p.blocks);
+            let mut index = vec![usize::MAX; p.blocks.len()];
+            for (i, &b) in order.iter().enumerate() {
+                index[b] = i;
+            }
+            let mut edges = Vec::new();
+            for &b in &order {
+                for s in p.blocks[b].exit.successors() {
+                    if index[s] <= index[b] {
+                        edges.push((b, s));
+                    }
+                }
+            }
+            edges
+        };
+        let before = back(&p);
+        assert_eq!(before.len(), 2, "{before:?}");
+        assert_eq!(before[0].1, before[1].1, "one header");
+        let q = single_latches(&p).expect("two back edges");
+        let after = back(&q);
+        let [(latch, header)] = after[..] else {
+            panic!("{after:?}")
+        };
+        assert!(q.blocks[latch].insts.is_empty());
+        assert_eq!(q.blocks[latch].exit, Exit::Jump(header));
+        assert_eq!(q.blocks[latch].preds.len(), 2);
+        // The same instructions, in the same blocks otherwise.
+        let names = |p: &Program| -> Vec<&'static str> { p.blocks.iter().flat_map(|b| b.insts.iter().map(Inst::name)).collect() };
+        let (mut a, mut b) = (names(&p), names(&q));
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b);
+        // s0 comes into the header from before the loop and from the latch.
+        let phi = q.blocks[header].phis.iter().find(|phi| phi.reg == Reg::S(0)).expect("s0 phi");
+        assert_eq!(phi.args.len(), 2);
+        // Once is enough.
+        assert!(single_latches(&q).is_none());
+        // One back edge: nothing to do.
+        let one = build_words(
+            &[
+                0xBE80_0380, // s_mov_b32 s0, 0
+                0x8000_8100, // 4: s_add_u32 s0, s0, 1
+                0xBF07_8400, // s_cmp_lg_u32 s0, 4
+                0xBF85_FFFD, // s_cbranch_scc1 -> 4
+                S_ENDPGM,
+            ],
+            true,
+        );
+        assert!(single_latches(&one).is_none());
     }
 }

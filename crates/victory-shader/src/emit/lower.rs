@@ -394,6 +394,9 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// [`Self::abort_block`]'s blocks by loop header, with
+    /// [`super::CFG_STOP_PER_LOOP`].
+    loop_aborts: HashMap<usize, usize>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -2147,6 +2150,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            loop_aborts: HashMap::new(),
         }
     }
 
@@ -13019,7 +13023,7 @@ impl<'a> Lower<'a> {
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
-                let abort = self.abort_block();
+                let abort = self.abort_block(t);
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
             LaneExit::Jump(t) => {
@@ -13143,9 +13147,16 @@ impl<'a> Lower<'a> {
         over
     }
 
-    /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
-    fn abort_block(&mut self) -> usize {
-        if let Some(a) = self.abort {
+    /// The block a lane stopped by [`LOOP_LIMIT`] leaves through: one for
+    /// every loop, or one per loop header `header` with
+    /// [`super::CFG_STOP_PER_LOOP`].
+    fn abort_block(&mut self, header: usize) -> usize {
+        let per_loop = super::cfg_form() & super::CFG_STOP_PER_LOOP != 0;
+        if per_loop {
+            if let Some(&a) = self.loop_aborts.get(&header) {
+                return a;
+            }
+        } else if let Some(a) = self.abort {
             return a;
         }
         let a = self.s.m.new_block();
@@ -13155,6 +13166,10 @@ impl<'a> Lower<'a> {
                 .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
         }
         self.s.m.terminate(a, Term::Ret);
+        if per_loop {
+            self.loop_aborts.insert(header, a);
+            return a;
+        }
         self.abort = Some(a);
         a
     }

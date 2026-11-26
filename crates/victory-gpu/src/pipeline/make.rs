@@ -43,6 +43,8 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
+    /// Its host compile thread ended without an answer (`VICTORY_PIPE_FIX`).
+    died: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -68,6 +70,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            died: AtomicBool::new(false),
         }
     }
 
@@ -75,17 +78,153 @@ impl Pending {
         &self.key
     }
 
-    fn make(&self) {
-        self.made.get_or_init(|| {
-            let _building = crate::timeline::span("pipeline: build a host pipeline");
-            let began = Instant::now();
-            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
-            super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
-            made
-        });
+    fn make(self: &Arc<Self>) {
+        if pipe_fix() {
+            // A panic while making it leaves it with no host pipeline
+            // instead of "being made" for ever, and the worker lives.
+            let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.made.get_or_init(|| {
+                    let _building = crate::timeline::span("pipeline: build a host pipeline");
+                    let began = Instant::now();
+                    let made = host_compile(self);
+                    super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+                    made
+                });
+            }));
+            if made.is_err() && self.made.set(None).is_ok() {
+                tracing::warn!(shaders = ?self.shaders, "making a host pipeline panicked: its draws are dropped");
+            }
+        } else {
+            self.made.get_or_init(|| {
+                let _building = crate::timeline::span("pipeline: build a host pipeline");
+                let began = Instant::now();
+                let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+                super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+                made
+            });
+        }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
+    }
+}
+
+/// `VICTORY_PIPE_FIX=1` (off by default): host compiles on threads of their
+/// own, and other control-flow shapes when one dies (issues #111, #73).
+/// On Wine/vkd3d-proton/RADV a few compute programs (the screen-space and
+/// tiled ray-traced shadow traces among them) never got a host pipeline:
+/// vkd3d-proton's DXIL-to-SPIR-V conversion (dxil-spirv, on the calling
+/// thread) recurses without bound on a loop header with several back edges
+/// in a program with lane shuffles; Wine logs
+/// "err:virtual:virtual_setup_exception stack overflow" right after the
+/// shader is translated and ends the thread without unwinding. That thread
+/// was a pipeline worker inside `make`: the pipeline stayed "being made"
+/// for the rest of the run, every later first use waited for it and spent
+/// the frame's whole wait budget (`VICTORY_PIPELINE_WAIT_MS`, half a second
+/// a frame: "475-525 ms waiting for pipelines" in every frame, 3.4 fps at
+/// the opening of the story on an RX 7900 XT; 13.8 fps and 0.0 ms with the
+/// switch), and a worker was lost each time.
+/// With the switch the host compile runs on a thread of its own, waited for
+/// by its handle; if that thread ends without an answer, the shaders are
+/// translated again with one latch per loop
+/// ([`victory_shader::emit::CFG_FORM_RETRIES`], what DXC emits) and
+/// compiled on a new thread; only if every shape dies is the pipeline
+/// dropped (its draws dropped as an untranslated shader's are).
+fn pipe_fix() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_PIPE_FIX").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("VICTORY_PIPE_FIX: host compiles on threads of their own, other control-flow shapes when one dies");
+        }
+        on
+    })
+}
+
+/// A made pipeline handed back from its compile thread.
+struct Made(Option<HostPipeline>);
+// SAFETY: D3D12 objects are free-threaded (as for `Pending`).
+unsafe impl Send for Made {}
+
+/// A host compile thread that ended without an answer.
+struct Died;
+
+/// [`HostPipeline::new`] for `p`, on a thread of its own; when that thread
+/// dies, the programs again in the other control-flow shapes
+/// ([`victory_shader::emit::CFG_FORM_RETRIES`]), each on a new thread.
+fn host_compile(p: &Arc<Pending>) -> Option<HostPipeline> {
+    if let Ok(made) = compile_on_thread(p, &p.shaders) {
+        return made;
+    }
+    for form in victory_shader::emit::CFG_FORM_RETRIES {
+        let others: Vec<Option<Arc<Shader>>> = p.shaders.iter().map(|s| s.in_form(form)).collect();
+        if others.iter().all(Option::is_none) {
+            continue;
+        }
+        let shaders: Vec<Arc<Shader>> = others
+            .into_iter()
+            .zip(&p.shaders)
+            .map(|(other, s)| other.unwrap_or_else(|| s.clone()))
+            .collect();
+        if let Ok(made) = compile_on_thread(p, &shaders) {
+            tracing::warn!(
+                shaders = ?p.shaders,
+                form,
+                made = made.is_some(),
+                "a host compile thread died; the programs in another control-flow shape compiled"
+            );
+            return made;
+        }
+    }
+    p.died.store(true, Ordering::Relaxed);
+    tracing::warn!(
+        shaders = ?p.shaders,
+        "the host compile thread ended without an answer in every control-flow shape (on Wine: a stack \
+         overflow in the host's shader compiler, err:virtual:virtual_setup_exception above): its draws are dropped"
+    );
+    None
+}
+
+/// [`HostPipeline::new`] of `shaders` (with `p`'s graphics state) on a
+/// thread of its own (8 MiB of stack, below-normal priority), waited for by
+/// its handle; [`Died`] if the thread ended without an answer.
+fn compile_on_thread(p: &Arc<Pending>, shaders: &[Arc<Shader>]) -> Result<Option<HostPipeline>, Died> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let q = p.clone();
+    let owned = shaders.to_vec();
+    let spawned = std::thread::Builder::new()
+        .name("victory-pipeline-compile".into())
+        .stack_size(8 << 20)
+        .spawn(move || {
+            // SAFETY: a plain call on our own thread.
+            unsafe {
+                use windows::Win32::System::Threading::*;
+                let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            }
+            let _ = tx.send(Made(HostPipeline::new(&owned, q.graphics.as_deref())));
+        });
+    let thread = match spawned {
+        Ok(thread) => thread,
+        Err(e) => {
+            tracing::warn!(error = %e, "no thread for a host compile: made on this one");
+            return Ok(HostPipeline::new(shaders, p.graphics.as_deref()));
+        }
+    };
+    // SAFETY: the thread's handle, open while `thread` lives. It is
+    // signalled when the thread ends, however it ends.
+    unsafe {
+        WaitForSingleObject(HANDLE(thread.as_raw_handle()), INFINITE);
+    }
+    // Dropping the handle detaches it (no join: a killed thread never
+    // stored a result for `join` to take).
+    drop(thread);
+    match rx.try_recv() {
+        Ok(Made(made)) => Ok(made),
+        Err(_) => Err(Died),
     }
 }
 
@@ -95,6 +234,9 @@ impl Pending {
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
+        Some(None) if p.died.load(Ordering::Relaxed) => {
+            Some("the host compile thread ended without an answer (stack overflow in the host compiler)".into())
+        }
         None => Some("being made".into()),
         Some(None) => {
             let failed: Vec<String> = p

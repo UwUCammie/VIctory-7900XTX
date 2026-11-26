@@ -186,6 +186,47 @@ impl Shader {
             })
             .as_ref()
     }
+
+    /// This shader translated again in control-flow shape `form`
+    /// ([`victory_shader::emit::cfg_form`]), not through the shader cache,
+    /// as a shader of its own (same stage, hash and container). `None` if
+    /// it does not translate that way, if the shape changes nothing, or if
+    /// the translation would bind anything differently (user data,
+    /// samplers, root views): the pipeline's draws bind by the first
+    /// translation.
+    pub(crate) fn in_form(&self, form: u32) -> Option<Arc<Shader>> {
+        let first = self.translated()?;
+        let host = victory_shader::emit::with_cfg_form(form, || victory_shader::emit::translate(&self.container)).ok()?;
+        let binds_alike = host.stage == first.host.stage
+            && host.user_data == first.host.user_data
+            && host.samplers == first.host.samplers
+            && host.static_samplers == first.host.static_samplers
+            && host.root_cbvs == first.host.root_cbvs
+            && host.root_srvs == first.host.root_srvs
+            && host.root_uavs == first.host.root_uavs
+            && host.root_indexed_views == first.host.root_indexed_views;
+        if host.dxil == first.host.dxil || !binds_alike {
+            return None;
+        }
+        let other = Shader {
+            stage: self.stage,
+            hash: self.hash.clone(),
+            container: self.container.clone(),
+            ambient: self.ambient,
+            translated: OnceLock::new(),
+        };
+        let tables = crate::draw::TablePlan::new(&first.used, &host.root_indexed_views);
+        let _ = other.translated.set(Some(Translated {
+            host,
+            tables,
+            threads: first.threads,
+            used: first.used.clone(),
+            stores: first.stores,
+            stores_by_address: first.stores_by_address,
+            picks: std::sync::atomic::AtomicU8::new(first.picks.load(std::sync::atomic::Ordering::Relaxed)),
+        }));
+        Some(Arc::new(other))
+    }
 }
 
 #[cfg(windows)]
