@@ -14,6 +14,8 @@ On the first run with an empty shader cache and the fork’s default play preset
 
 The next run used the same executable with `VICTORY_RELAY=1` and `VICTORY_CARD_STEPS=0`, as suggested in [the RADV report](https://github.com/avatarmanz/VIctory-7900XTX/issues/13). The first room, character and movement prompt were visible at 170 s. It accepted 234 presents in 73.15 s (3.20 FPS, 4,948 draws/frame) and completed the 230-second session without a device-loss report. The cache had also warmed since the first run, so this pair cannot isolate the effect of either switch.
 
+After offline shader precompilation, a repeat with the same RADV settings accepted 236 presents in 74.14 s (3.18 FPS, 4,959 draws/frame). The first room was visible at 175 s and the process ran the full 230 seconds without a device-loss report. The two visible-room runs together averaged 3.19 FPS (470 presents in 147.29 s).
+
 For comparison, the [fxceless-based integration](https://github.com/UwUCammie/victory-amd/tree/bench/first-room-radv/benchmarks#measurements) on the same machine averaged 8.71 FPS across two first-room trials with 16 KiB readbacks. That integration had a warm cache, different runtime settings and some additional patches.
 
 ## Descriptor heap rescan
