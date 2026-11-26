@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery};
 
 /// Where a question comes from.
 #[derive(Clone, Copy)]
@@ -72,6 +72,7 @@ pub(crate) fn query(site: Site, at: usize, info: &mut MEMORY_BASIC_INFORMATION) 
 /// What [`coarse`] answers: of the pages from `at`'s on, `[base, end)`
 /// (`end` may lie short of the region's real end), their state, kind and
 /// allocation base. No protection.
+#[derive(Clone, Copy)]
 pub(crate) struct Coarse {
     pub base: usize,
     pub end: usize,
@@ -95,6 +96,16 @@ impl Coarse {
 fn cache_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_QUERY_CACHE").is_some_and(|v| v == "1"))
+}
+
+/// Reserved ranges have a short lifetime because ordinary VirtualAlloc
+/// commits can bypass the runtime's notifications.
+fn hole_frames() -> u64 {
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("VICTORY_QUERY_HOLE_FRAMES")
+            .ok().and_then(|value| value.trim().parse().ok()).unwrap_or(0)
+    })
 }
 
 const BLOCK: usize = 64 << 10;
@@ -121,11 +132,31 @@ impl Entry {
 
 struct Cache {
     blocks: HashMap<usize, Entry>,
+    holes: BTreeMap<usize, (Coarse, u64)>,
     /// The runtime's memory of the title's, joined: start -> end.
     title: BTreeMap<usize, usize>,
 }
 
 impl Cache {
+    fn hole_at(&self, at: usize, frame: u64, lifetime: u64) -> Option<Coarse> {
+        if lifetime == 0 {
+            return None;
+        }
+        let (_, &(hole, seen)) = self.holes.range(..=at).next_back()?;
+        (at < hole.end && frame.saturating_sub(seen) < lifetime).then_some(hole)
+    }
+
+    fn drop_holes(&mut self, at: usize, end: usize) {
+        if at >= end || self.holes.is_empty() {
+            return;
+        }
+        let before = self.holes.range(..at).next_back().filter(|(_, (r, _))| r.end > at).map(|(&s, _)| s);
+        let inside: Vec<_> = self.holes.range(at..end).map(|(&s, _)| s).collect();
+        for start in before.into_iter().chain(inside) {
+            self.holes.remove(&start);
+        }
+    }
+
     /// Whether all of `[at, end)` is the title's.
     fn titles(&self, at: usize, end: usize) -> bool {
         self.title.range(..=at).next_back().is_some_and(|(_, &e)| e >= end)
@@ -172,7 +203,7 @@ impl Cache {
 }
 
 static CACHE: std::sync::LazyLock<Mutex<Cache>> =
-    std::sync::LazyLock::new(|| Mutex::new(Cache { blocks: HashMap::new(), title: BTreeMap::new() }));
+    std::sync::LazyLock::new(|| Mutex::new(Cache { blocks: HashMap::new(), holes: BTreeMap::new(), title: BTreeMap::new() }));
 
 /// Bumped by every change: a question put before one is not kept.
 static EPOCH: AtomicU64 = AtomicU64::new(0);
@@ -184,13 +215,21 @@ fn cache() -> std::sync::MutexGuard<'static, Cache> {
 /// `VirtualQuery(at)` for a caller that needs no protection; `None` if
 /// Windows does not answer.
 pub(crate) fn coarse(site: Site, at: usize) -> Option<Coarse> {
-    if !cache_on() {
+    let holes = if matches!(site, Site::UncommittedEnd) { hole_frames() } else { 0 };
+    let kept = cache_on();
+    if !kept && holes == 0 {
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         return (query(site, at, &mut info) != 0).then(|| Coarse::of(&info));
     }
     let page = at & !(KERNEL_PAGE - 1);
+    let frame = if holes != 0 { crate::frame::current() } else { 0 };
     {
         let c = cache();
+        if let Some(mut hole) = c.hole_at(page, frame, holes) {
+            HITS[site as usize].fetch_add(1, Ordering::Relaxed);
+            hole.base = page;
+            return Some(hole);
+        }
         let b = at / BLOCK;
         if let Some(e) = c.blocks.get(&b)
             && page >= e.from
@@ -209,7 +248,21 @@ pub(crate) fn coarse(site: Site, at: usize) -> Option<Coarse> {
         return None;
     }
     let answer = Coarse::of(&info);
-    if answer.state == MEM_COMMIT && matches!(answer.kind, MEM_MAPPED | MEM_PRIVATE) && answer.base == page {
+    if holes != 0 && answer.state == MEM_RESERVE && answer.end.saturating_sub(page) >= BLOCK {
+        let mut c = cache();
+        if EPOCH.load(Ordering::SeqCst) == epoch {
+            const CAPACITY: usize = 8_192;
+            if c.holes.len() >= CAPACITY {
+                c.holes.retain(|_, (_, seen)| frame.saturating_sub(*seen) < holes);
+                if c.holes.len() >= CAPACITY {
+                    c.holes.clear();
+                }
+            }
+            c.drop_holes(answer.base, answer.end);
+            c.holes.insert(answer.base, (answer, frame));
+        }
+    }
+    if kept && answer.state == MEM_COMMIT && matches!(answer.kind, MEM_MAPPED | MEM_PRIVATE) && answer.base == page {
         let mut c = cache();
         // Nothing changed since the question, and the runtime's memory.
         if EPOCH.load(Ordering::SeqCst) == epoch {
@@ -237,20 +290,33 @@ pub(crate) fn coarse(site: Site, at: usize) -> Option<Coarse> {
 /// The runtime gave the title `[at, at + len)` (allocated, committed, or
 /// mapped a view there): done, before it is told.
 pub fn came(at: usize, len: usize) {
-    if !cache_on() || len == 0 {
+    let kept = cache_on();
+    if (!kept && hole_frames() == 0) || len == 0 {
         return;
     }
     let mut c = cache();
     EPOCH.fetch_add(1, Ordering::SeqCst);
     let end = at.saturating_add(len);
-    c.drop_blocks(at, end);
-    c.entitle(at, end);
+    c.drop_holes(at, end);
+    if kept {
+        c.drop_blocks(at, end);
+        c.entitle(at, end);
+    }
 }
 
 /// `[at, at + len)` is about to be freed, decommitted or unmapped (with no
 /// length: the whole allocation at `at`).
 pub fn gone(at: usize, len: usize) {
     if !cache_on() {
+        if hole_frames() != 0 {
+            let mut c = cache();
+            EPOCH.fetch_add(1, Ordering::SeqCst);
+            if len == 0 {
+                c.holes.clear();
+            } else {
+                c.drop_holes(at, at.saturating_add(len));
+            }
+        }
         return;
     }
     let end = if len != 0 {
@@ -277,6 +343,7 @@ pub fn gone(at: usize, len: usize) {
     if len == 0 {
         c.blocks.retain(|_, e| e.alloc != at);
     }
+    c.drop_holes(at, end);
     c.drop_blocks(at, end);
     c.untitle(at, end);
 }
@@ -305,4 +372,22 @@ pub(crate) fn line(frames: f64) {
         if cache_on() { format!(", {} blocks kept", cache().blocks.len()) } else { String::new() },
         parts.join(", ")
     );
+}
+
+
+#[cfg(test)]
+#[test]
+fn hole_answers_expire_and_only_overlapping_notifications_invalidate_them() {
+    let mut cache = Cache { blocks: HashMap::new(), holes: BTreeMap::new(), title: BTreeMap::new() };
+    for base in [2 * BLOCK, 6 * BLOCK] {
+        cache.holes.insert(base, (Coarse { base, end: base + 2 * BLOCK, alloc: base, state: MEM_RESERVE, kind: 0 }, 4));
+    }
+    assert_eq!(cache.hole_at(3 * BLOCK, 7, 4).unwrap().end, 4 * BLOCK);
+    assert!(cache.hole_at(4 * BLOCK, 7, 4).is_none());
+    assert!(cache.hole_at(3 * BLOCK, 8, 4).is_none());
+    cache.drop_holes(4 * BLOCK, 6 * BLOCK);
+    assert_eq!(cache.holes.len(), 2);
+    cache.drop_holes(3 * BLOCK, 5 * BLOCK);
+    assert!(cache.hole_at(3 * BLOCK, 7, 4).is_none());
+    assert!(cache.hole_at(6 * BLOCK, 7, 4).is_some());
 }
