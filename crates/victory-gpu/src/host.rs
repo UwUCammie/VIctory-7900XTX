@@ -4962,10 +4962,7 @@ impl Host {
                     queue.ExecuteCommandLists(&lists);
                     queue.Signal(&fence, sent)?;
                     meanwhile();
-                    fence.SetEventOnCompletion(sent, event)?;
-                    #[cfg(feature = "diagnostics")]
-                    let _card = crate::timeline::card_wait(None);
-                    WaitForSingleObject(event, INFINITE);
+                    wait_host_fence(&fence, sent, event, "relay copy-queue readback");
                     return Ok(behind);
                 }
                 // In the order of the queue: the sends of title bytes so
@@ -4977,10 +4974,7 @@ impl Host {
                 self.card_sent();
                 self.queue.Signal(&fence, sent)?;
                 meanwhile();
-                fence.SetEventOnCompletion(sent, event)?;
-                #[cfg(feature = "diagnostics")]
-                let _card = crate::timeline::card_wait(None);
-                WaitForSingleObject(event, INFINITE);
+                wait_host_fence(&fence, sent, event, "relay drawing-queue readback");
                 Ok(after)
             })()
         };
