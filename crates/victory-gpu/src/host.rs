@@ -5337,7 +5337,30 @@ impl Host {
 
     /// [`Host::execute_late`] of parts of submissions in one: another begins
     /// at each place of `order` in `parts` ([`joins`]).
-    pub(crate) fn execute_parts(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
+    pub(crate) fn execute_parts(&self, mut lists: Vec<crate::list::Detached>, mut order: Vec<usize>, parts: &[usize]) {
+        if order.is_empty() {
+            crate::list::recycle(lists, &order);
+            return;
+        }
+        // Textures uploaded ahead (`crate::heap_worker`, from
+        // fxceless/victory-fork #1007): their lists run before the title's,
+        // in the first part.
+        let ahead = crate::heap_worker::take_ready();
+        if ahead.is_empty() {
+            self.execute_parts_now(lists, order, parts);
+            return;
+        }
+        let n = ahead.len();
+        let first = lists.len();
+        order.splice(0..0, first..first + n);
+        lists.extend(ahead.into_iter().map(crate::list::Detached::ours));
+        let parts: Vec<usize> = parts.iter().map(|&p| p + n).collect();
+        self.execute_parts_now(lists, order, &parts);
+    }
+
+    /// [`Host::execute_parts`] once the lists uploaded ahead are among
+    /// `lists`.
+    fn execute_parts_now(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
         if order.is_empty() {
             crate::list::recycle(lists, &order);
             return;
@@ -5351,8 +5374,8 @@ impl Host {
                 Ok([(lists, order), (more, behind)]) => {
                     let first: Vec<usize> = parts.iter().copied().filter(|&p| p < cut).collect();
                     let second: Vec<usize> = parts.iter().filter(|&&p| p > cut).map(|p| p - cut).collect();
-                    self.execute_parts(lists, order, &first);
-                    self.execute_parts(more, behind, &second);
+                    self.execute_parts_now(lists, order, &first);
+                    self.execute_parts_now(more, behind, &second);
                 }
                 Err((lists, order)) => self.send_late(lists, order, parts),
             }
@@ -7525,6 +7548,21 @@ impl HostList {
         self.deferred().copies.push(Step::Texture(staging));
     }
 
+    /// Detiles the textures the list uploads now, ahead of its submission
+    /// ([`crate::texture::Staging::refresh_ahead`]); how many were left.
+    pub(crate) fn refresh_textures_ahead(&self) -> u64 {
+        let textures: Vec<_> = self
+            .deferred()
+            .copies
+            .iter()
+            .filter_map(|step| match step {
+                Step::Texture(staging) => Some(staging.clone()),
+                _ => None,
+            })
+            .collect();
+        textures.iter().filter(|staging| !staging.refresh_ahead()).count() as u64
+    }
+
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges). Copies and fills that
@@ -9095,6 +9133,19 @@ impl Meter {
             let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
             let picked_ms =
                 crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+            // From fxceless/victory-fork #1007.
+            {
+                let [busy, detiling, lists, shown, again, left] =
+                    std::array::from_fn::<f64, 6, _>(|i| crate::heap_worker::STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                if busy > 0.0 {
+                    tracing::info!(
+                        "textures picked by index, their own thread (VICTORY_HEAP_WORKER), per frame: {:.1} ms at work, of them {:.1} detiling; \
+                         {lists:.1} lists, {shown:.0} slots shown, {again:.1} written again before, {left:.1} textures left to the submission",
+                        busy / 1e6,
+                        detiling / 1e6
+                    );
+                }
+            }
             // Copies between depth textures and their colour twins, each way.
             let [twin_to_depth, twin_to_colour] =
                 [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
