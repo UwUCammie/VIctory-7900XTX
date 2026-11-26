@@ -342,7 +342,7 @@ mod tests {
         if windows::core::Interface::cast::<ID3D12Device13>(&device).is_err() {
             return;
         }
-        reserved_section_round_trip(&device);
+        reserved_section_round_trip(&device, false);
     }
 
     /// Run on the same D3D12 adapter the renderer selects. This checks the CPU's writes
@@ -350,15 +350,27 @@ mod tests {
     #[test]
     #[ignore = "requires a D3D12 device that supports opening an existing heap"]
     fn preferred_adapter_reserved_section_round_trip() {
+        check_preferred_adapter(false);
+    }
+
+    /// The GPU must continue to see changes even if every page was already
+    /// written from the CPU before the heap was opened.
+    #[test]
+    #[ignore = "requires a D3D12 device that supports opening an existing heap"]
+    fn preferred_adapter_prefilled_reserved_section_round_trip() {
+        check_preferred_adapter(true);
+    }
+
+    fn check_preferred_adapter(prefill: bool) {
         let _turn = crate::indirect::tests::warp_turn();
         let device = victory_shader::emit::host::create_preferred_device()
             .expect("the selected adapter must support D3D12");
         windows::core::Interface::cast::<ID3D12Device13>(&device)
             .expect("the selected device must support ID3D12Device13");
-        reserved_section_round_trip(&device);
+        reserved_section_round_trip(&device, prefill);
     }
 
-    fn reserved_section_round_trip(device: &ID3D12Device) {
+    fn reserved_section_round_trip(device: &ID3D12Device, prefill: bool) {
         const K: usize = 64 << 10;
         // SAFETY (the whole test): the section, placeholder and views made
         // here.
@@ -383,6 +395,9 @@ mod tests {
                 let view = mem::MapViewOfFile3(section, process, hole.add(page * K).cast(), (page * K) as u64, n * K, mem::MEM_REPLACE_PLACEHOLDER, mem::PAGE_READWRITE, std::ptr::null_mut(), 0);
                 assert!(!view.Value.is_null(), "{}", std::io::Error::last_os_error());
                 assert!(!mem::VirtualAlloc(view.Value, n * K, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null());
+                if prefill {
+                    std::ptr::write_bytes(view.Value.cast::<u8>(), 0xa5, n * K);
+                }
                 crate::inplace::title_memory_view(view.Value as usize, n * K, section as usize, (page * K) as u64);
                 views.push(view);
             }
@@ -405,6 +420,7 @@ mod tests {
             let got = rig.fetch(&placed.buffer, placed.bias, expected.len()).unwrap();
             let mismatched = expected.iter().zip(&got).position(|(cpu, gpu)| cpu != gpu);
             let all_zero = got.iter().all(|byte| *byte == 0);
+            let all_prefill = prefill && got.iter().all(|byte| *byte == 0xa5);
 
             let marker = [0x5a; 256];
             let offset = 3 * K;
@@ -430,7 +446,7 @@ mod tests {
             windows_sys::Win32::Foundation::CloseHandle(section);
             assert!(
                 cpu_alias_reads && mismatched.is_none() && original_sees_write && alias_sees_write && gpu_sees_write,
-                "CPU alias matches={cpu_alias_reads}, GPU first mismatch={mismatched:?}, GPU read all zero={all_zero}, \
+                "CPU alias matches={cpu_alias_reads}, GPU first mismatch={mismatched:?}, GPU read all zero={all_zero}, GPU read prefill={all_prefill}, \
                  GPU write visible in original={original_sees_write}, in CPU alias={alias_sees_write}, on GPU={gpu_sees_write}"
             );
         }
