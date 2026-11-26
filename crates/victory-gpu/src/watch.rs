@@ -927,6 +927,12 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// it. Zero means it has never been read. The journal still records every
 /// new write even when the caller needs only the asking number.
 pub(crate) fn unchanged_since(start: usize, end: usize, guarded: bool, since: u64) -> Option<(u64, bool)> {
+    static SUMMARY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*SUMMARY.get_or_init(|| std::env::var_os("VICTORY_TEST_TEXTURE_WRITE_QUERY").is_some_and(|v| v == "1")) {
+        return writes(start, end, guarded).map(|(now, pages)| {
+            (now, since != 0 && pages.iter().all(|&(_, write)| write <= since))
+        });
+    }
     with_writes(start, end, guarded, |j, pages| {
         since != 0 && j.written.range(pages).all(|(_, &write)| write <= since)
     })
