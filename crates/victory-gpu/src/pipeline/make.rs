@@ -398,6 +398,12 @@ fn compute_left(since: Duration, making: Duration) -> Duration {
     COMPUTE_BUDGET.saturating_sub(since).min(COMPUTE_BUDGET.saturating_sub(making))
 }
 
+/// Whether a dispatch with wait budget may promote its queued compute build.
+fn prioritize_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRIORITIZE_COMPUTE_WAIT").is_some_and(|v| v == "1"))
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
@@ -446,17 +452,25 @@ fn wait(p: &Pending, frame: u64) {
         left
     };
     if left.is_zero() {
-        if compute && !p.compute_dropped.swap(true, Ordering::Relaxed) {
+        if compute && p.made.get().is_none() && !p.compute_dropped.swap(true, Ordering::Relaxed) {
             tracing::info!(
                 shaders = %hashes(p),
                 frame,
+                worker_started = p.making_since.get().is_some(),
                 "a compute dispatch was dropped: its pipeline is not made and this frame's compute waits took 10 s"
             );
         }
         return;
     }
-    let waiting = crate::timeline::span("pipeline: first use waits for a host pipeline");
     let started = Instant::now();
+    if compute && prioritize_waits() && p.queue_state.load(Ordering::Relaxed) == REQUESTED {
+        let ahead = QUEUE.lock().unwrap_or_else(|e| e.into_inner()).promote_wait(p);
+        if let Some(ahead) = ahead {
+            static FIRST: std::sync::Once = std::sync::Once::new();
+            FIRST.call_once(|| tracing::info!(ahead, "a compute dispatch promoted a queued build while it could still wait"));
+        }
+    }
+    let waiting = crate::timeline::span("pipeline: first use waits for a host pipeline");
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
@@ -495,6 +509,7 @@ fn wait(p: &Pending, frame: u64) {
             shaders = %hashes(p),
             frame,
             waited_ms = waited.as_millis() as u64,
+            worker_started = p.making_since.get().is_some(),
             "a compute dispatch was dropped: its pipeline was not made within this frame's compute waits"
         );
     }
@@ -518,7 +533,8 @@ fn wait(p: &Pending, frame: u64) {
 const NOT_QUEUED: u8 = 0;
 const EARLY: u8 = 1;
 const REQUESTED: u8 = 2;
-const MAKING: u8 = 3;
+const AWAITED: u8 = 3;
+const MAKING: u8 = 4;
 
 /// How many workers may make pipelines at once that are known to take long
 /// and that no draw has asked for: a quarter of them. On a fresh cache (a
@@ -546,6 +562,10 @@ struct Queue {
     /// Requested compute pipelines whose dispatches wait
     /// ([`compute_waits`]): next, before the requested graphics.
     compute: VecDeque<Arc<Pending>>,
+    /// Compute builds promoted by a dispatch with time left to wait, in arrival order.
+    awaited: VecDeque<Arc<Pending>>,
+    /// Give the oldest ordinary compute request the next turn after a promotion.
+    ordinary_next: bool,
     early: VecDeque<Arc<Pending>>,
     /// Those of the early ones known to take long, and how many of them are
     /// being made ([`slow_limit`]).
@@ -559,6 +579,8 @@ impl Queue {
         Self {
             screen: VecDeque::new(),
             compute: VecDeque::new(),
+            awaited: VecDeque::new(),
+            ordinary_next: false,
             early: VecDeque::new(),
             slow: VecDeque::new(),
             slow_now: 0,
@@ -597,6 +619,28 @@ impl Queue {
         Some(prev == NOT_QUEUED)
     }
 
+    /// Move an already queued request. The outstanding build count stays the same.
+    fn promote_wait(&mut self, p: &Pending) -> Option<usize> {
+        let at = self.compute.iter().position(|candidate| std::ptr::eq(candidate.as_ref(), p))?;
+        if at == 0 {
+            return None;
+        }
+        let job = self.compute.remove(at)?;
+        job.queue_state.store(AWAITED, Ordering::Relaxed);
+        self.awaited.push_back(job);
+        Some(at)
+    }
+
+    fn pop_compute(&mut self) -> Option<Arc<Pending>> {
+        if self.awaited.is_empty() || (self.ordinary_next && !self.compute.is_empty()) {
+            self.ordinary_next = false;
+            self.compute.pop_front()
+        } else {
+            self.ordinary_next = true;
+            self.awaited.pop_front()
+        }
+    }
+
     fn pop(&mut self, screens_only: bool, slow_limit: usize) -> Option<Arc<Pending>> {
         // An early entry can have been promoted and claimed already.
         let unclaimed = |list: &mut VecDeque<Arc<Pending>>| {
@@ -604,7 +648,7 @@ impl Queue {
         };
         let mut p = self.screen.pop_front();
         if p.is_none() && !screens_only {
-            p = self.compute.pop_front().or_else(|| self.requested.pop_front()).or_else(|| unclaimed(&mut self.early));
+            p = self.pop_compute().or_else(|| self.requested.pop_front()).or_else(|| unclaimed(&mut self.early));
             if p.is_none() && self.slow_now < slow_limit {
                 p = unclaimed(&mut self.slow);
                 if let Some(p) = &p {
@@ -860,6 +904,30 @@ mod tests {
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &compute));
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+    }
+
+    #[test]
+    fn awaited_compute_alternates_with_older_requests() {
+        let mut queue = Queue::new();
+        let jobs: Vec<_> = (0..5).map(|_| {
+            let mut p = Pending::new(Vec::new(), None);
+            p.compute = true;
+            Arc::new(p)
+        }).collect();
+        for p in &jobs {
+            assert_eq!(queue.push_as(p, REQUESTED, false), Some(true));
+        }
+        assert_eq!(queue.promote_wait(&jobs[0]), None);
+        assert_eq!(queue.promote_wait(&jobs[3]), Some(3));
+        assert_eq!(queue.promote_wait(&jobs[3]), None);
+        assert_eq!(queue.promote_wait(&jobs[4]), Some(3));
+        assert!(queue.pop(true, 1).is_none());
+        for i in [3, 0, 4, 1, 2] {
+            let p = queue.pop(false, 1).unwrap();
+            assert!(Arc::ptr_eq(&p, &jobs[i]));
+            assert_eq!(p.queue_state.load(Ordering::Relaxed), MAKING);
+        }
+        assert!(queue.pop(false, 1).is_none());
     }
 
     /// Compute waits are bounded by the frame's and the pipeline's budget.
