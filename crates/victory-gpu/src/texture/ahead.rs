@@ -234,7 +234,9 @@ impl Worker {
             }
             let failed: Vec<_> = jobs.extract_if(.., |job| {
                 job.staging.refresh();
-                job.staging.last.lock().unwrap_or_else(|e| e.into_inner()).incomplete
+                // An entirely unmapped source can skip conversion altogether.
+                job.staging.last.lock().unwrap_or_else(|e| e.into_inner()).conversion
+                    != super::Conversion::Ready
             }).collect();
             if !failed.is_empty() {
                 finish(failed, false);
@@ -355,6 +357,42 @@ pub(crate) fn fresh() -> AtomicU8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unmapped_source_stays_available_to_the_direct_upload_path() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        if crate::host::host().is_none() {
+            return;
+        }
+        let desc = [3u32, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
+        let whole = crate::resource::placed_bytes(&desc).unwrap() as usize;
+        // The placed resource stays registered for the process. Reserve its
+        // address without committing any of its pages.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), whole, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!at.is_null());
+        let texture = crate::resource::texture_at(at as u64, &desc).unwrap();
+        crate::resource::want_level(texture, 0);
+        let Some(Taken::New(job)) = claim(texture, 0, u64::MAX) else { panic!("upload not taken") };
+        let (told, heard) = std::sync::mpsc::channel();
+        job.then(move || told.send(()).unwrap());
+        send(&job);
+        listed(&job.copy);
+        assert_eq!(
+            heard.recv_timeout(std::time::Duration::from_secs(5)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+        );
+        assert_eq!(job.copy.ahead.load(Relaxed), LISTED);
+        assert!(!job.staging.uploaded.load(Relaxed));
+
+        // Once the address becomes readable the normal refresh can stage it.
+        let committed = unsafe { VirtualAlloc(at, whole, MEM_COMMIT, PAGE_READWRITE) };
+        assert_eq!(committed, at);
+        unsafe { std::ptr::write_bytes(at.cast::<u8>(), 0x54, whole) };
+        job.staging.refresh();
+        assert!(job.staging.last.lock().unwrap().conversion == super::super::Conversion::Ready);
+        assert!(!job.staging.uploaded.load(Relaxed));
+        eprintln!("unmapped ahead source deferred and then staged after commit");
+    }
 
     /// The texels of a placed texture arrive by the copy queue, all levels of
     /// them, and what waits for them is called then; a second asking finds the

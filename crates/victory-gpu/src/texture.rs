@@ -99,8 +99,7 @@ pub(crate) struct Staging {
 struct Last {
     hash: Option<Digest>,
     asked: u64,
-    /// The last conversion failed and the ahead upload must retry.
-    incomplete: bool,
+    conversion: Conversion,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
     /// Until this frame a guarded texture is hashed at every check: its
@@ -113,6 +112,15 @@ struct Last {
     /// The frame it was read in ahead of its submission
     /// ([`Staging::refresh_ahead`]; from fxceless/victory-fork #1007).
     ahead: Option<u64>,
+}
+
+/// Whether the staging buffer can be copied by the ahead queue.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Conversion {
+    #[default]
+    Empty,
+    Ready,
+    Failed,
 }
 
 /// Whether a texture asks the write watch / its guards at most once a
@@ -135,16 +143,16 @@ impl Last {
         if hash.is_some() && self.hash == hash {
             return false;
         }
-        self.incomplete = !convert();
-        if self.incomplete {
+        if !convert() {
+            self.conversion = Conversion::Failed;
             self.hash = None;
             self.asked = 0;
             return false;
         }
+        self.conversion = Conversion::Ready;
         self.hash = hash;
         true
     }
-
 }
 
 /// Frames a guarded texture is hashed at every check from its first check,
@@ -1177,7 +1185,7 @@ impl Staging {
     /// refresh detiles anew, whether the memory changed or not.
     fn forget(&self) {
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
-        *last = Last { incomplete: last.incomplete, ..Last::default() };
+        *last = Last { conversion: last.conversion, ..Last::default() };
     }
 
     /// The title memory the texture is read from: address and bytes.
@@ -1272,7 +1280,7 @@ impl Staging {
         {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
-            if !last.incomplete {
+            if last.conversion != Conversion::Failed {
                 last.asked = now;
             }
             let frame = crate::frame::current();
@@ -2113,7 +2121,7 @@ mod detile_retry {
         assert_eq!(output, [0x42, 0x42, 0x42, 0x42, 0, 0]);
         assert!(refresh(&mut last, &layout, &input, &mut output, &mut calls));
         assert_eq!(output, [0x42; 6]);
-        assert!(!last.incomplete);
+        assert!(last.conversion == super::Conversion::Ready);
         assert_eq!(last.hash, Some(digest(&input)));
         assert!(!refresh(&mut last, &layout, &input, &mut output, &mut calls));
         assert_eq!(calls, 2);
@@ -2132,7 +2140,7 @@ mod detile_retry {
         last.asked = 7;
         assert!(!refresh(&mut last, &layout, &b, &mut output[..5], &mut calls));
         assert_eq!(output, [0xb2, 0xb2, 0xb2, 0xb2, 0xa1, 0xa1]);
-        assert!(last.incomplete);
+        assert!(last.conversion == super::Conversion::Failed);
         assert_eq!(last.hash, None);
         assert_eq!(last.asked, 0);
 
@@ -2170,9 +2178,9 @@ mod detile_retry {
         let mut last = Last { asked: 7, ..Last::default() };
         assert!(!last.convert(None, || false));
         assert_eq!(last.asked, 0);
-        assert!(last.incomplete);
+        assert!(last.conversion == super::Conversion::Failed);
         assert!(last.convert(None, || true));
-        assert!(!last.incomplete);
+        assert!(last.conversion == super::Conversion::Ready);
     }
 }
 
