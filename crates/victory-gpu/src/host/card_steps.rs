@@ -668,7 +668,11 @@ mod late {
 
     pub(super) fn on() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_STEPS_LEARN").is_none_or(|v| v != "0"))
+        *ON.get_or_init(|| {
+            let enabled = std::env::var_os("VICTORY_CARD_STEPS_LEARN").is_none_or(|v| v != "0");
+            tracing::info!("late card-step fills (VICTORY_CARD_STEPS_LEARN={})", u8::from(enabled));
+            enabled
+        })
     }
 
     /// Whether the title was found writing a page of `[from, to)` late.
