@@ -3194,6 +3194,12 @@ impl HostHeap {
         unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, kind) };
     }
 
+    #[cfg(test)]
+    pub(super) fn descriptor_bytes(&self, index: u32) -> Option<Vec<u8>> {
+        let mut bytes = vec![0; self.step as usize];
+        crate::host::read_into(self.cpu(index).ptr as *const u8, &mut bytes).then_some(bytes)
+    }
+
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,
