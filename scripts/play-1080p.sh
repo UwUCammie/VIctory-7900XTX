@@ -2,8 +2,8 @@
 # The title under Wine, straight into the game: Enter pressed past the title screen (--start:
 # from second 12, the world half a minute after the launch),
 # the title rendering at 1920x1080, and the settings measured fastest on an RX 7900 GRE with a
-# picture that is there (docs/linux-wine.md, "Above the title's 30 frames a second": 27 to 28 ms
-# a frame, 36 frames a second, in the first scene, where play.sh alone has 40 ms and 25):
+# picture that is there (docs/linux-wine.md, "Above the title's 30 frames a second": 22.6 ms a
+# frame, 44 frames a second, in the first scene, where play.sh alone has 40 ms and 25):
 #   VICTORY_OUTPUT=1920x1080          the title renders to that size itself
 #   VICTORY_PORT_CONSTANTS=1          renderer patch 1: the title's constants heap read by the
 #   VICTORY_PORT_DESCRIPTORS=1        card where the title writes it; patches 2 and 5 (6 and 7
@@ -15,6 +15,8 @@
 #                                     only after a frame of 500 draws or more: in the world,
 #                                     where it gains 3 ms, and not in the intro videos, whose
 #                                     frames come three new and then the same three again joined
+#   VICTORY_WC_NO_BACK=1              what shaders write into title memory asked for as write-
+#                                     combined stays on the card (25.1 -> 22.6 ms a frame, run 95)
 # and one for the picture:
 #   VICTORY_AMBIENT=constant:0.08  the same faint light everywhere, so that people and the
 #                                  inside of cars can be made out at night (play.sh's 0.8 is an
@@ -46,4 +48,4 @@ exec "$here/play.sh" --start "${options[@]}" "$exe" \
     VICTORY_OUTPUT=1920x1080 \
     VICTORY_PORT_CONSTANTS=1 VICTORY_PORT_DESCRIPTORS=1 VICTORY_PORT_CBV=1 \
     VICTORY_FRAME_INTERVAL_MS=16.667 VICTORY_CARD_BUFFERS_MIN_KB=64 \
-    VICTORY_JOIN_PARTS_DRAWS=500 VICTORY_AMBIENT=constant:0.08 "${settings[@]}"
+    VICTORY_JOIN_PARTS_DRAWS=500 VICTORY_WC_NO_BACK=1 VICTORY_AMBIENT=constant:0.08 "${settings[@]}"

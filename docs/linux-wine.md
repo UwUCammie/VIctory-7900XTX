@@ -849,6 +849,16 @@ lock for a third of a millisecond at a time, 2,000 times a second.
 10. Everything of 2026-11-27 was measured in the title's first scene, a cutscene at night.
     Not in play, not by day, not in traffic.
 
+11. `VICTORY_WC_NO_BACK=1` (Belobug/VIctory-Belobug-AMD pull request 477, by
+    icecreammule277-dot; its seven commits picked onto this branch): what shaders write into
+    title memory the title asked for as write-combined stays on the card. The launcher's
+    settings, 200 s read from second 100: 25.1 ms a frame without (run 94, 39.8 frames a
+    second), 22.6 with (run 95, 44.3), the submitting thread working 22.4 and 17.6 ms of
+    them; on this branch merged with main, by turns, 33.2 and 32.2 ms without and 29.0 and
+    27.9 with (runs 90 to 93). The frames of the world kept of a run with it are whole
+    pictures, faces too (run 96), and so it looked on the screen: `scripts/play-1080p.sh`
+    sets it. One run of each on this branch, and the first scene alone.
+
 ## Tools
 
 In `~/Games/victory-logs/tools/`, outside the repository (its policy takes no Python files):
