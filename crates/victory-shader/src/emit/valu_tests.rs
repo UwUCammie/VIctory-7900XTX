@@ -303,7 +303,7 @@ fn rdna2_lane_select_wraps_wave32_reads_and_writes() {
     });
 
     let write_cases = [[4, 4, 123, 0], [36, 4, 123, 0], [68, 4, 123, 0], [36, 5, 123, 0]];
-    let mut write = Vec::from(vop3(0x361, 0, sgpr(2), sgpr(0), vgpr(0))); // v_writelane_b32 v0, s2, s0
+    let mut write = Vec::from(vop3(0x361, 0, sgpr(2), sgpr(0), 0)); // v_writelane_b32 v0, s2, s0
     write.extend_from_slice(&vop3(0x360, 12, vgpr(0), sgpr(1), 0)); // v_readlane_b32 s12, v0, s1
     write.push(vop1(1, 0, sgpr(12))); // v_mov_b32 v0, s12
     run_cases_on(&build_cs(&write, 32, 0), &write_cases, &[("hardware", false)], |_, _, input, got| {
