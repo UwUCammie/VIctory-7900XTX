@@ -630,30 +630,40 @@ fn rename(mut blocks: Vec<Block>, wave64: bool, vgprs: u16) -> Program {
         Value(values - 1)
     };
     let mut inputs = Vec::new();
-    let mut outs: Vec<Vec<(Reg, Value)>> = vec![Vec::new(); blocks.len()];
+    let mut outs: Vec<Vec<(u16, Value)>> = vec![Vec::new(); blocks.len()];
     let mut current = [NONE; REGS];
     for &b in &order {
         current.fill(NONE);
         let block = &mut blocks[b];
-        for reg in members(&live_in[b]) {
-            current[index(reg)] = match block.preds[..] {
-                [] => {
-                    let v = new_value();
-                    inputs.push((reg, v));
-                    v
-                }
-                // A single predecessor comes earlier in reverse postorder.
-                [p] => lookup(&outs[p], reg),
-                _ => {
-                    let value = new_value();
-                    block.phis.push(Phi {
-                        reg,
-                        value,
-                        args: Vec::new(),
-                    });
-                    value
-                }
-            };
+        // A single predecessor comes earlier in reverse postorder. With the
+        // same live sets, copy its values in one pass instead of searching
+        // for each register.
+        if let [p] = block.preds[..]
+            && live_in[b] == live_out[p]
+        {
+            for &(reg, value) in &outs[p] {
+                current[usize::from(reg)] = value;
+            }
+        } else {
+            for reg in members(&live_in[b]) {
+                current[index(reg)] = match block.preds[..] {
+                    [] => {
+                        let v = new_value();
+                        inputs.push((reg, v));
+                        v
+                    }
+                    [p] => lookup(&outs[p], reg),
+                    _ => {
+                        let value = new_value();
+                        block.phis.push(Phi {
+                            reg,
+                            value,
+                            args: Vec::new(),
+                        });
+                        value
+                    }
+                };
+            }
         }
         for inst in &mut block.insts {
             for (reg, v) in &mut inst.reads {
@@ -665,8 +675,8 @@ fn rename(mut blocks: Vec<Block>, wave64: bool, vgprs: u16) -> Program {
                 current[index(*reg)] = *v;
             }
         }
-        outs[b] = members(&live_out[b])
-            .map(|reg| (reg, current[index(reg)]))
+        outs[b] = member_indices(&live_out[b])
+            .map(|reg| (reg as u16, current[reg]))
             .collect();
     }
     for block in &mut blocks {
@@ -1012,12 +1022,16 @@ fn contains(set: &RegSet, reg: Reg) -> bool {
 
 /// In [`Reg`] order, which is also index order.
 fn members(set: &RegSet) -> impl Iterator<Item = Reg> + '_ {
+    member_indices(set).map(reg_at)
+}
+
+fn member_indices(set: &RegSet) -> impl Iterator<Item = usize> + '_ {
     let (mut word, mut bits) = (0, set[0]);
     std::iter::from_fn(move || loop {
         if bits != 0 {
             let b = bits.trailing_zeros() as usize;
             bits &= bits - 1;
-            return Some(reg_at(word * 64 + b));
+            return Some(word * 64 + b);
         }
         word += 1;
         if word >= set.len() {
@@ -1027,9 +1041,9 @@ fn members(set: &RegSet) -> impl Iterator<Item = Reg> + '_ {
     })
 }
 
-/// `outs` is sorted by register, and holds every register live out.
-fn lookup(outs: &[(Reg, Value)], reg: Reg) -> Value {
-    outs.binary_search_by_key(&reg, |&(r, _)| r)
+/// `outs` is sorted by register index, and holds every register live out.
+fn lookup(outs: &[(u16, Value)], reg: Reg) -> Value {
+    outs.binary_search_by_key(&(index(reg) as u16), |&(r, _)| r)
         .map_or(NONE, |i| outs[i].1)
 }
 
