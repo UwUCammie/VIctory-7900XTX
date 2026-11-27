@@ -1176,46 +1176,34 @@ mod tests {
         plan(does, 2, true, &mut None).unwrap()
     }
 
-    /// A place written between sending and landing is learned, page by page;
-    /// one left alone is not.
+    /// Learn late writes from both fill paths while their title pages are
+    /// distinct and still live.
     #[test]
-    fn places_written_after_sending_are_learned() {
-        // Two pages of memory of our own, page-aligned, as title memory.
-        let memory = vec![0u8; 4 * 4096];
-        let page = (memory.as_ptr() as usize).next_multiple_of(4096);
-        let (kept, changed) = (page, page + 4096 + 64);
-        // What the card read: the bytes as they were, at 0 and 256 of the
-        // buffer between.
-        let sent = [(kept, 32, 0), (changed, 240, 256)];
-        let card = vec![0u8; 512];
-        // SAFETY: inside `memory`.
-        unsafe { *(changed as *mut u8).add(88) = 1 };
-        assert!(!late::written(kept, kept + 32) && !late::written(changed, changed + 240));
-        late::compare(&sent, &card);
-        assert!(!late::written(kept, kept + 32));
-        assert!(late::written(changed, changed + 240));
-        // The whole page: another constant buffer in it waits too.
-        assert!(late::written(page + 4096, page + 4096 + 16));
-        drop(memory);
-    }
-
-    /// A fill the CPU did into upload memory, whose place the title wrote
-    /// again before landing, is learned; one that still matches is not.
-    #[test]
-    fn fills_done_on_the_cpu_are_learned_too() {
-        let memory = vec![0u8; 4 * 4096];
-        let page = (memory.as_ptr() as usize).next_multiple_of(4096);
-        let (kept, changed) = (page + 16, page + 4096 + 0xbd0);
-        // The upload memory each was filled into: the bytes as they were.
-        let upload = vec![0u8; 1024];
+    fn labels_pages_written_after_sending_for_both_fill_paths() {
+        const PAGE: usize = 4096;
+        let mut memory = vec![0u8; 5 * PAGE];
+        let pages = (memory.as_mut_ptr() as usize).next_multiple_of(PAGE);
+        let (card_same, card_changed) = (pages, pages + PAGE + 64);
+        let (cpu_same, cpu_changed) = (pages + 2 * PAGE + 16, pages + 3 * PAGE + 0xbd0);
+        let card_fills = [(card_same, 32, 0), (card_changed, 240, 256)];
+        let card = [0u8; 512];
+        let upload = [0u8; 1024];
         let up = upload.as_ptr() as usize;
-        let cpu = [(up, kept, 32), (up + 512, changed, 0x220)];
-        // SAFETY: inside `memory`.
-        unsafe { *(changed as *mut u8).add(0x100) = 7 };
-        late::landed_cpu(&cpu);
-        assert!(!late::written(kept, kept + 32));
-        assert!(late::written(changed, changed + 0x220));
-        drop((memory, upload));
+        let cpu_fills = [(up, cpu_same, 32), (up + 512, cpu_changed, 0x220)];
+        assert!(!late::written(pages, pages + 4 * PAGE));
+        // SAFETY: both writes are within the owned allocation.
+        unsafe {
+            *(card_changed as *mut u8).add(88) = 1;
+            *(cpu_changed as *mut u8).add(0x100) = 7;
+        }
+        late::compare(&card_fills, &card);
+        late::landed_cpu(&cpu_fills);
+        assert!(!late::written(card_same, card_same + 32));
+        assert!(!late::written(cpu_same, cpu_same + 32));
+        assert!(late::written(card_changed, card_changed + 240));
+        assert!(late::written(cpu_changed, cpu_changed + 0x220));
+        assert!(late::written(pages + PAGE, pages + PAGE + 16));
+        drop(memory);
     }
 
     /// Only what is asked for is taken, all of it, and a step that stands
