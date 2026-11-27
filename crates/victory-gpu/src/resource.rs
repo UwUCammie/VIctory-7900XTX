@@ -131,7 +131,7 @@ const TEXTURE_3D: u32 = 4;
 /// compression), by DXGI format number. `None` for 1-bit and video
 /// formats. The console adds 116/117 (10-bit float color), 118-120 (16-bit
 /// depth with 8-bit stencil, two planes: 3 bytes per texel), 189 (signed
-/// 10-bit color), 190 (two 4-bit channels) and 191 (24/8 color).
+/// 10-bit color) and 190 (two 4-bit channels). Format 191 is A4B4G4R4_UNORM.
 pub(crate) fn element(format: u32) -> Option<(u64, u64)> {
     Some(match format {
         1..=4 => (16, 1),
@@ -3323,6 +3323,13 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn packed_rgba4444_uses_two_bytes_per_texel() {
+        assert_eq!(element(191), Some((2, 1)));
+        let layout = victory_formats::texture::format(191).unwrap();
+        assert_eq!((layout.bytes, layout.block, layout.stencil), (2, 1, false));
+    }
 
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {

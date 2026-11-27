@@ -389,8 +389,12 @@ mod tests {
 
     #[test]
     fn vop1_without_operands_has_no_extension_word() {
-        assert_eq!(summary(&[0x7E00_00FF, S_ENDPGM]), [(0, 1, "v_nop"), (4, 1, "s_endpgm")]);
-        assert_eq!(summary(&[0x7E00_36FF, S_ENDPGM]), [(0, 1, "v_pipeflush"), (4, 1, "s_endpgm")]);
+        for (opcode, name) in [(0x000, "v_nop"), (0x01B, "v_pipeflush"), (0x041, "v_clrexcp")] {
+            for marker in [0xFF, 0xF9, 0xFA, 0xE9, 0xEA] {
+                let word = 0x7E00_0000 | (opcode << 9) | marker;
+                assert_eq!(summary(&[word, S_ENDPGM]), [(0, 1, name), (4, 1, "s_endpgm")]);
+            }
+        }
     }
 
     #[test]
