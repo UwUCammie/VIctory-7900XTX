@@ -421,7 +421,7 @@ fn worker_count(asked: Option<usize>, processors: usize) -> usize {
 }
 
 /// Whether the host is Wine (its ntdll says which version).
-fn on_wine() -> bool {
+pub(crate) fn on_wine() -> bool {
     use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
     static WINE: OnceLock<bool> = OnceLock::new();
     // SAFETY: plain lookups in ntdll, always loaded.
