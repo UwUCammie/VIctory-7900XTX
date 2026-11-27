@@ -283,14 +283,14 @@ pub extern "system" fn CreateFileW(
 }
 
 /// Whether a title's read-only opens lose `FILE_FLAG_NO_BUFFERING` on the way
-/// to the host (`VICTORY_FILE_CACHE=0`: they keep it, as before). After
+/// to the host when `VICTORY_FILE_CACHE=1`. After
 /// Marvisak/VIctory#2667 (imjustprism's #2427): on the host the flag keeps
 /// every read out of the system file cache, so a title that opens its packs
 /// with it reads the same bytes from the drive on every launch.
 fn file_cache() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_FILE_CACHE").is_none_or(|v| v != "0");
+        let on = std::env::var_os("VICTORY_FILE_CACHE").is_some_and(|v| v == "1");
         tracing::info!(on, "files: read-only opens go through the host file cache (VICTORY_FILE_CACHE)");
         on
     })
