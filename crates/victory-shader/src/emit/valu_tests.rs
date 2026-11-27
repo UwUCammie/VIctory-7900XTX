@@ -862,6 +862,7 @@ fn float_compares_that_are_always_false_or_true() {
         [0x7E00, 0x3C00, 0, 0],
         [0x7E00, 0x7E00, 0, 0],
     ];
+    let mut hardware_cases = 0;
     // v_cmp_*_e64 s20, v1, v2; v_cndmask_b32_e64 v0, 0, 1, s20
     for (op, what, inputs, want) in [
         (0x000u16, "v_cmp_f_f32", f32_inputs, 0),
@@ -873,6 +874,7 @@ fn float_compares_that_are_always_false_or_true() {
         body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
         let shader = build_valu_cs(&body);
         run_cases(&shader, &inputs, |backend, _, inp, got| {
+            hardware_cases += usize::from(backend == "hardware");
             assert_eq!(
                 got, want,
                 "{backend}: {what}({:#010x}, {:#010x}) = {got}, want {want}",
@@ -880,6 +882,7 @@ fn float_compares_that_are_always_false_or_true() {
             );
         });
     }
+    eprintln!("constant float compare cases on hardware: {hardware_cases}");
 }
 
 #[test]
