@@ -11253,3 +11253,35 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+
+#[cfg(test)]
+mod upload_pool_tests {
+    use super::{card_steps, host, upload_pool};
+
+    #[test]
+    #[ignore = "requires D3D12 hardware, VICTORY_CARD_STEPS=2 and VICTORY_UPLOAD_POOL=1"]
+    fn only_released_uploads_return_to_the_pool_on_reset() {
+        assert!(card_steps::stage() > 1 && upload_pool());
+        let host = host().expect("D3D12 host");
+        let list = host.new_list().expect("host list");
+        let (retained, retained_data) = list.upload(host, 4096).expect("first upload");
+        list.close();
+        list.reset();
+
+        let (released, released_data) = list.upload(host, 8192).expect("second upload");
+        assert_ne!(retained, released, "the first upload remains in use");
+        assert_ne!(retained_data, released_data);
+        drop(released);
+        list.close();
+        list.reset();
+
+        let (_reused, reused_data) = list.upload(host, 4096).expect("reused upload");
+        assert_eq!(reused_data, released_data, "the second upload's mapping is reused");
+        // SAFETY: the returned shared upload is mapped and at least 4096 bytes long.
+        unsafe {
+            reused_data.write(0x73);
+            assert_eq!(reused_data.read(), 0x73);
+        }
+        eprintln!("upload pool reused only the released mapping after list reset");
+    }
+}
