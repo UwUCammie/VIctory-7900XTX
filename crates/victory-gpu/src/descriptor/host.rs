@@ -1097,6 +1097,9 @@ impl TextureQueue {
     /// frame line: total, due, still waiting for memory, partly uploaded, and
     /// the age of the oldest due write.
     fn snapshot(&self, frame: u64, collect_due: bool) -> (Due, [u64; 5]) {
+        if !collect_due {
+            return (Due::default(), self.census(frame));
+        }
         let mut due = Due::default();
         let mut counts = [self.slots.len() as u64, 0, 0, 0, 0];
         for (&index, w) in &self.slots {
@@ -1108,9 +1111,7 @@ impl TextureQueue {
             if w.due <= frame {
                 counts[1] += 1;
                 counts[4] = counts[4].max(frame.saturating_sub(w.written));
-                if collect_due {
-                    due[usize::from(w.looks == 0 && w.mapped == 0)].push((w.written, index, w.write));
-                }
+                due[usize::from(w.looks == 0 && w.mapped == 0)].push((w.written, index, w.write));
             }
         }
         (due, counts)
@@ -1256,9 +1257,21 @@ impl TextureQueue {
         self.slots.get(&index).map_or(0, |w| w.mapped)
     }
 
-    #[cfg(test)]
+    /// Collect just the frame-line counts when no due list is requested.
     fn census(&self, frame: u64) -> [u64; 5] {
-        self.snapshot(frame, false).1
+        let mut c = [self.slots.len() as u64, 0, 0, 0, 0];
+        for w in self.slots.values() {
+            if w.mapped > 0 {
+                c[3] += 1;
+            } else if w.looks > 0 {
+                c[2] += 1;
+            }
+            if w.due <= frame {
+                c[1] += 1;
+                c[4] = c[4].max(frame.saturating_sub(w.written));
+            }
+        }
+        c
     }
 }
 
