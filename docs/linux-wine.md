@@ -860,7 +860,7 @@ lock for a third of a millisecond at a time, 2,000 times a second.
 10. Everything of 2026-11-27 was measured in the title's first scene, a cutscene at night.
     Not in play, not by day, not in traffic.
 
-12. Lips did not move when people spoke: the heroine's mouth was shut in 21 frames in a row
+11. Lips did not move when people spoke: the heroine's mouth was shut in 21 frames in a row
     of three of her lines, eyes and head moving (run h02). In the frame recorded in run 68 the
     face deformer's shared input (`title buffer 0xda62c8580+0x104000`, 1 MiB) was all zeros on
     the card and in the copy of title memory, and nothing wrote it in the frame. Not the
@@ -888,37 +888,68 @@ lock for a third of a millisecond at a time, 2,000 times a second.
       same picture each time.
     - not the driver's compiler: a recorded frame's network replayed with RADV's ACO and with
       its LLVM backend (`RADV_DEBUG=llvm`) gives the same result word for word.
-11. `VICTORY_WC_NO_BACK=1` (Belobug/VIctory-Belobug-AMD pull request 477, by
+12. `VICTORY_WC_NO_BACK=1` (Belobug/VIctory-Belobug-AMD pull request 477, by
     icecreammule277-dot; its seven commits picked onto this branch): what shaders write into
-    title memory the title asked for as write-combined stays on the card. The launcher's
-    settings, 200 s read from second 100: 25.1 ms a frame without (run 94, 39.8 frames a
-    second), 22.6 with (run 95, 44.3), the submitting thread working 22.4 and 17.6 ms of
-    them; on this branch merged with main, by turns, 33.2 and 32.2 ms without and 29.0 and
-    27.9 with (runs 90 to 93). The frames of the world kept of a run with it are whole
-    pictures, faces too (run 96), and so it looked on the screen: `scripts/play-1080p.sh`
-    sets it. One run of each on this branch, and the first scene alone.
+    title memory the title asked for as write-combined stays on the card. On this branch, the
+    launcher's other settings, 200 s read from second 100, one run each: 38.0 ms a frame
+    without (run 130), 33.8 with (run 131), the submitting thread working 33.5 and 27.0 ms
+    of them. On the Linux branch alone (before main was merged in), 200 s read from second
+    100, no frames kept: 25.1 ms a frame without (run 94, 39.8 frames a second), 22.6 with
+    (run 95, 44.3), the submitting thread working 22.4 and 17.6 ms of them. The frames of the
+    world kept of the run with it are whole pictures, faces too. `scripts/play-1080p.sh` sets
+    it. The first scene alone.
 13. Where the submitting thread's time goes, and `VICTORY_CARD_TOUCHED=1`. The card is not
     what holds the frame back any more: its core runs at 2,460 MHz and it draws 127 to 133 W
-    of the 220 it may (`card-log.sh`, runs 119 to 128), while the submitting thread works
-    23 to 24 ms of a frame of 26 to 28. Sampled every 5 ms (`VICTORY_PROFILE`, run 123) that
+    of the 220 it may (runs 119 to 128), while the submitting thread works most of the
+    frame. Sampled every 5 ms (`VICTORY_PROFILE`, run 123, on the branch without main) that
     thread is parked 35 % of the time (waiting for its helpers or for work), 8.6 % in
     `NtGetWriteWatch`, 4.2 % in the diagnostics' `GetThreadTimes`, and 6.9 % in one function
     of ours: `shadow::card_dirty`, which at every submission, 28 a frame, asked each of the
     3,450 copies in the card's memory whether it had changed, where some 130 had.
     `VICTORY_CARD_TOUCHED=1` asks only the copies that were marked as changed. By turns of
-    10 s in one run (run 124): the thread's time for these copies 2.60 -> 1.30 ms a frame,
-    its work 23.7 -> 22.6 ms; the frame 27.2 -> 26.0 ms (median of five phases' medians each
-    side), which is within what the scene moves it by from one phase to the next (2 to
-    5 ms), so the frame's gain is not shown, the thread's is. The picture as before, with it
-    on for a whole run too (run 129). `scripts/play-1080p.sh` sets it.
+    10 s in one run (run 124, the branch without main): the thread's time for these copies
+    2.60 -> 1.30 ms a frame, its work 23.7 -> 22.6 ms; the frame 27.2 -> 26.0 ms (median of
+    five phases' medians each side), within what the scene moves it by from one phase to the
+    next, so the frame's gain is not shown, the thread's is. The picture as before.
+    `scripts/play-1080p.sh` sets it. Unset, every copy is asked as before.
 
     Tried the same day and not kept, each a run or two: the Series S profile (27.9 ms
-    against 28.2, and blocks of pixels on faces and arms; runs 119 and 120); two presents
-    in the line (`VICTORY_SUBMIT_FRAMES=2`: the title's wait at presents 10.5 -> 0.0 ms, the
-    frame no shorter, run 121); joined parts sent to the queue in one call (26.1 against
-    25.8 ms, run 118). A thread's priority asked above normal changes nothing here: every
-    thread of the process has nice 0, the submitting one too, since the process may not
-    raise one (`Max nice priority 0`).
+    against 28.2, and blocks of pixels on faces and arms); two presents in the line
+    (`VICTORY_SUBMIT_FRAMES=2`: the title's wait at presents 10.5 -> 0.0 ms, the frame no
+    shorter); joined parts sent to the queue in one call (26.1 against 25.8 ms). A thread's
+    priority asked above normal changes nothing here: every thread of the process has nice
+    0, the submitting one too, since the process may not raise one (`Max nice priority 0`).
+14. This branch (the Linux branch merged with main) against the Linux branch alone, the same
+    settings, in turn, 200 s each and no frames kept (runs 133 to 136): 31.1 and 27.0 ms a
+    frame here, 26.6 and 27.9 there; the submitting thread working 22.2 and 19.1 ms here,
+    20.5 and 20.6 there. No difference is shown: this branch's two runs lie 4 ms apart.
+    (A first version of this item said this branch was 6 ms slower. That compared runs that
+    kept every eighth frame of the world as a picture, `VICTORY_CAPTURE_WORLD=1`, with runs
+    that did not: keeping them costs several ms a frame, 33.8 ms with against 27.0 to 31.1
+    without on this branch. The figures of item 12 are both from runs that kept them, so
+    their difference stands and their level is some ms too high.)
+
+15. FSR 4 at the output's own size, as anti-aliasing (`VICTORY_FSR_4K=native`, avatarmanz
+    pull request 444's output size, the PC upscaler from AMD's signed
+    `amd_fidelityfx_upscaler_dx12.dll` with Proton's `amdxc64.dll` and `amdxcffx64.dll`,
+    `VICTORY_FSR_VERSION=4.1.1`, `DXIL_SPIRV_CONFIG=wmma_rdna3_workaround`). The launcher's
+    settings with main's order of clamps off, 200 s each, in turn, no frames kept (runs 137
+    to 142):
+
+    | Upscaler | Picture made at | Frame (median) | Card |
+    |---|---|---|---|
+    | the title's own | 1280x720 | 25.2 and 27.9 ms | 140 W, 82 % busy |
+    | FSR 4.1.1 `quality` | 1280x720 | 25.4 and 26.1 ms | 144 W, 85 % |
+    | FSR 4.1.1 `native` | 1920x1080 | 27.0 and 26.7 ms | 169 W, 96 % |
+
+    The card takes the extra work in the room it had; the submitting thread, which sets the
+    pace, works as before. Whole-size pictures of the same shot of the police check (runs 143
+    to 145, `frame-3322`, `-3321` and `-3191`): face, glasses and collar are sharp with
+    `native` and soft with the title's upscaler, `quality` between them (`sheets/fsr/` beside
+    the logs). `scripts/play-1080p.sh` uses `native` when it finds the DLL (`FIDELITYFX_DIR`,
+    by default Forza Horizon 6's Steam folder, where this PC has one; `FIDELITYFX_DIR=none`
+    for the title's upscaler). Not provided to FSR: the exposure, reactive and transparency
+    masks (others reported noise on particles from that; not looked at here).
 
 ## Tools
 

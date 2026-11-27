@@ -308,6 +308,76 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
 }
 
+/// Whether indirect executions whose arguments or count lie in title memory
+/// the card reads in place (renderer port 1, `VICTORY_PORT_CONSTANTS=1`) are
+/// clamped alone, right before they run (`VICTORY_PORT_CONSTANTS_ORDER`; `=0`:
+/// in batches and windows as any other).
+///
+/// A batch or a window clamps records ahead: in the pass recorded where it
+/// was opened, before the commands between it and the execution that reads
+/// the record. For a host copy that is fine, its bytes are the title's of
+/// the submission. Where the card reads the title's memory in place, the
+/// records the title's culling passes write between the two are read before
+/// they are written: the execution draws the records of an earlier frame,
+/// or none. With port 1 on, palms and trees in the boat mission's cutscene
+/// were missing for runs of frames while the camera moved (runs pop-5,
+/// pop-11 to pop-13), and with ports 1 and 5 off they were not (pop-10;
+/// POPIN.md).
+fn in_place_order() -> bool {
+    crate::toggled!("VICTORY_PORT_CONSTANTS_ORDER")
+}
+
+/// With [`in_place_order`]: such executions never in a batch (unset or
+/// `VICTORY_PORT_CONSTANTS_ORDER_ALONE=1`: the palms stayed in every frame,
+/// run pop-14). `=0`: in a batch opened after the last shader that may
+/// write buffers; not enough, the palms still came and went (run pop-15).
+fn in_place_alone() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_CONSTANTS_ORDER_ALONE").is_none_or(|v| v != "0"))
+}
+
+/// Since the last line: indirect executions with arguments in place, those
+/// clamped alone for it, and the 1 MiB ranges they came from (diagnostics).
+static IN_PLACE_INDIRECT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static IN_PLACE_RANGES: std::sync::Mutex<std::collections::BTreeMap<u64, [u64; 3]>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// An indirect execution of `kind` with its arguments at `arguments` in place.
+fn in_place_indirect(arguments: u64, kind: u32) {
+    IN_PLACE_INDIRECT[0].fetch_add(1, Ordering::Relaxed);
+    IN_PLACE_INDIRECT[1].fetch_add(u64::from(in_place_order()), Ordering::Relaxed);
+    let slot = match kind {
+        2 => 1,
+        10 => 2,
+        _ => 0,
+    };
+    let mut ranges = IN_PLACE_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+    ranges.entry(arguments >> 20).or_default()[slot] += 1;
+}
+
+/// With the frame line: indirect executions with arguments in place per
+/// frame over `frames`, and the ranges most of them came from.
+pub(crate) fn in_place_indirect_line(frames: f64) {
+    let [all, alone] = [0, 1].map(|i| IN_PLACE_INDIRECT[i].swap(0, Ordering::Relaxed));
+    if all == 0 {
+        return;
+    }
+    let ranges = std::mem::take(&mut *IN_PLACE_RANGES.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut by: Vec<(u64, [u64; 3])> = ranges.into_iter().collect();
+    by.sort_by_key(|(_, n)| std::cmp::Reverse(n.iter().sum::<u64>()));
+    let top: Vec<String> = by
+        .iter()
+        .take(6)
+        .map(|(mb, n)| format!("{:#x}+1MiB: {:.0} draws {:.0} dispatches {:.0} mesh", mb << 20, n[0] as f64 / frames, n[1] as f64 / frames, n[2] as f64 / frames))
+        .collect();
+    tracing::info!(
+        "renderer port 1: indirect executions with arguments or count in place per frame: {:.0}, of them {:.0} clamped after every shader write before them (VICTORY_PORT_CONSTANTS_ORDER); from {} ranges of 1 MiB, the busiest: {}",
+        all as f64 / frames,
+        alone as f64 / frames,
+        by.len(),
+        top.join("; ")
+    );
+}
+
 /// Whether indirect executions of one record are clamped in batches
 /// (`crate::indirect::batch`; `VICTORY_INDIRECT_BATCH=0`: each on its own,
 /// or in windows ([`windows`])).
@@ -1042,6 +1112,14 @@ impl State {
 
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
         self.pipeline = pipeline as usize;
+    }
+
+    /// A host compute library bound its own pipeline, root signature and heaps.
+    pub(crate) fn external_compute(&mut self) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [usize::MAX; 2];
+        self.host_heaps_set = false;
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
@@ -2791,6 +2869,19 @@ impl State {
         });
     }
 
+    /// Diagnostics: what kind of dispatch `p` is, for the stamps around it.
+    #[cfg(feature = "diagnostics")]
+    fn stamp_kind(&self, p: &HostPipeline) -> crate::host::rtstamps::Kind {
+        use crate::host::rtstamps::Kind;
+        if crate::pipeline::is_builder(self.pipeline as This) {
+            Kind::Builder
+        } else if p.stages.iter().any(|s| s.translated().host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY)) {
+            Kind::Walks
+        } else {
+            Kind::Other
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
@@ -2861,8 +2952,14 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
+        #[cfg(feature = "diagnostics")]
+        let stamp = crate::host::rtstamps::before(&list.list);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        if stamp.is_some() {
+            crate::host::rtstamps::after(&list.list, stamp, self.stamp_kind(p), p.pso.as_raw() as usize, &p.name);
+        }
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
@@ -4100,8 +4197,27 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        // Renderer port 1: arguments (or their count) in the title's memory
+        // read in place ([`in_place_order`]): clamped alone, right before
+        // their execution, after a wait for every earlier shader write.
+        let in_place = args.in_place() || counter.as_ref().is_some_and(|(s, _)| s.in_place());
+        if in_place {
+            in_place_indirect(arguments, kind);
+        }
+        let ordered = in_place && in_place_order();
+        // Alone (`VICTORY_PORT_CONSTANTS_ORDER_ALONE=1`): no batch at all.
+        // Else a batch that a shader writing buffers was recorded after is
+        // not used: a new one is opened here, after it (what
+        // `VICTORY_INDIRECT_BATCH=1` does for every batch).
+        let alone = ordered && in_place_alone();
+        if ordered {
+            if alone || self.batch.as_ref().is_some_and(|b| b.wrote) {
+                self.batch = None;
+            }
+            self.window = None;
+        }
         // One record without a count: clamped in a batch (`batches`).
-        let batch = if batches() > 0 && max == 1 && count.is_none() {
+        let batch = if !alone && batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
             self.batched(list, &args, arguments, kind)
         } else {
@@ -4117,6 +4233,7 @@ impl State {
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
         let windowed = windows()
+            && !ordered
             && kind != DISPATCH
             && max == 1
             && count.is_none()
@@ -4212,6 +4329,8 @@ impl State {
         }
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
+        #[cfg(feature = "diagnostics")]
+        let stamp = if kind == DISPATCH { crate::host::rtstamps::before(&list.list) } else { None };
         unsafe {
             list.list.ExecuteIndirect(
                 &signature,
@@ -4224,6 +4343,10 @@ impl State {
         };
         if kind == MESH {
             self.mesh_scissor(list, false);
+        }
+        #[cfg(feature = "diagnostics")]
+        if stamp.is_some() {
+            crate::host::rtstamps::after(&list.list, stamp, self.stamp_kind(p), p.pso.as_raw() as usize, &p.name);
         }
         if kind == DISPATCH {
             self.buffers_written();
@@ -4464,7 +4587,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+                .is_some_and(|source| crate::texture::alias(list, *resource as This, source.get()));
             if !aliased
                 && let Some(t) = crate::resource::host_copy(*resource as This)
                 && t.flags() & 0x7 == 0
@@ -4505,11 +4628,11 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 }
             }
         }
-        (View::Unordered(resource, _, _), ResourceType::Uav) => {
+        (View::Unordered(resource, _, desc), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
             // Some compute-written textures are also read by the title CPU.
-            list.texture_written(*resource as This);
+            list.texture_written(*resource as This, desc.as_ref());
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
@@ -4817,3 +4940,7 @@ mod record_hash_tests {
         assert!(zeros.iter().all(|h| seen.insert(*h)));
     }
 }
+
+#[cfg(all(test, feature = "diagnostics"))]
+#[path = "draw/texback_test.rs"]
+mod texback_test;

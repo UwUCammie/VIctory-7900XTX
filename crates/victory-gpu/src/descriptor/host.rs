@@ -1921,6 +1921,12 @@ impl HostHeap {
         self.count
     }
 
+    /// Leave some space for lists that need to finish before the queue can
+    /// submit them. Called between thin recording chunks.
+    pub(crate) fn dynamic_pressure(&self) -> bool {
+        self.free.load(std::sync::atomic::Ordering::Relaxed) < self.dynamic.saturating_mul(5) / 8
+    }
+
     /// Writes the word of the table of element strides for the dynamic slot
     /// `index`, which holds `view` of a table made afresh: shaders ask it
     /// whether a typed view in a table is of an integer format
@@ -2376,7 +2382,7 @@ impl HostHeap {
             let old = view_at(shown as u32, (shown >> 32) as u32);
             let kept = old.is_some_and(|old| match kin(&old, &view) {
                 Kin::Same => true,
-                kin => kin.kept(keep_shown()),
+                kin => crate::resource::room_lately() && kin.kept(keep_shown()),
             });
             if shown == 0 || !kept {
                 #[cfg(feature = "diagnostics")]
@@ -3362,7 +3368,7 @@ impl HostHeap {
                 // ([`keep_shown`]): black, then grey for a frame or two is
                 // what popped.
                 if is_texture_view(&old) {
-                    let kept = kin.kept(keep_shown());
+                    let kept = crate::resource::room_lately() && kin.kept(keep_shown());
                     rewritten(kin, kept);
                     if kept {
                         drop(held);
@@ -3392,7 +3398,7 @@ impl HostHeap {
                 let old = view_at(shown as u32, (shown >> 32) as u32);
                 let kept = old.is_some_and(|old| match kin(&old, &view) {
                     Kin::Same => true,
-                    kin => kin.kept(keep_shown()),
+                    kin => crate::resource::room_lately() && kin.kept(keep_shown()),
                 });
                 if shown == 0 || !kept {
                     #[cfg(feature = "diagnostics")]
@@ -3678,7 +3684,7 @@ pub(crate) fn half_inexact(view: &View) -> Option<u32> {
     (!EXACT.contains(&format)).then_some(format)
 }
 
-fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+pub(crate) fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     let mut words = *words;
     words[0] = crate::resource::pc_format(words[0]);
     // SAFETY: 40 bytes in the host's layout.
@@ -4496,7 +4502,9 @@ fn make_twinned(
                 if copy.base > 0
                     && let Some(desc) = &mut desc
                 {
-                    from_base(desc, copy.base);
+                    // SAFETY: a live resource.
+                    let own_mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+                    from_base(desc, copy.base, own_mips);
                 }
                 // Made whole from the store: all its levels.
                 let prefilled = copy.prefilled.load(std::sync::atomic::Ordering::Relaxed);
@@ -4660,18 +4668,34 @@ fn show_prefilled(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, levels: u32) {
 /// The view `desc` of a texture, of a host copy of its levels from `base`
 /// on (`crate::resource::held_only`). What it shows of larger ones, if any,
 /// is left out.
-fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32) {
-    if desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D {
-        return;
+fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32, own_mips: u32) {
+    let clamp_mips = |most: &mut u32, levels: &mut u32, lod: &mut f32| {
+        let lost = base.saturating_sub(*most);
+        *most = most.saturating_sub(base);
+        if own_mips > 0 {
+            *most = (*most).min(own_mips - 1);
+        }
+        if *levels != u32::MAX {
+            *levels = levels.saturating_sub(lost).max(1);
+            if own_mips > 0 {
+                *levels = (*levels).min(own_mips.saturating_sub(*most)).max(1);
+            }
+        }
+        *lod = (*lod - base as f32).max(0.0);
+    };
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.Texture2D };
+            clamp_mips(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.Texture2DArray };
+            clamp_mips(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+        }
+        _ => {}
     }
-    // SAFETY: the member its dimension says.
-    let t = unsafe { &mut desc.Anonymous.Texture2D };
-    let lost = base.saturating_sub(t.MostDetailedMip);
-    t.MostDetailedMip = t.MostDetailedMip.saturating_sub(base);
-    if t.MipLevels != u32::MAX {
-        t.MipLevels = t.MipLevels.saturating_sub(lost).max(1);
-    }
-    t.ResourceMinLODClamp = (t.ResourceMinLODClamp - base as f32).max(0.0);
 }
 
 /// Writes of a slot with another view of the placed texture it showed,
@@ -5199,7 +5223,7 @@ mod tests {
         let view = |first, levels, clamp| {
             let mut desc = srv_desc(&[98, 4, 5768, 0, first, levels, 0, 0, 0, 0]);
             desc.Anonymous.Texture2D.ResourceMinLODClamp = clamp;
-            from_base(&mut desc, 3);
+            from_base(&mut desc, 3, 10);
             // SAFETY: the member its dimension says.
             let t = unsafe { desc.Anonymous.Texture2D };
             (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp)

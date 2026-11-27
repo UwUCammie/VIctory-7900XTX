@@ -2,8 +2,8 @@
 # The title under Wine, straight into the game: Enter pressed past the title screen (--start:
 # from second 12, the world half a minute after the launch),
 # the title rendering at 1920x1080, and the settings measured fastest on an RX 7900 GRE with a
-# picture that is there (docs/linux-wine.md, "Above the title's 30 frames a second": 22.6 ms a
-# frame, 44 frames a second, in the first scene, where play.sh alone has 40 ms and 25):
+# picture that is there (docs/linux-wine.md, "Above the title's 30 frames a second": 27 to 28 ms
+# a frame, 36 frames a second, in the first scene, where play.sh alone has 40 ms and 25):
 #   VICTORY_OUTPUT=1920x1080          the title renders to that size itself
 #   VICTORY_PORT_CONSTANTS=1          renderer patch 1: the title's constants heap read by the
 #   VICTORY_PORT_DESCRIPTORS=1        card where the title writes it; patches 2 and 5 (6 and 7
@@ -18,10 +18,19 @@
 #                                     where it gains 3 ms, and not in the intro videos, whose
 #                                     frames come three new and then the same three again joined
 #   VICTORY_WC_NO_BACK=1              what shaders write into title memory asked for as write-
-#                                     combined stays on the card (25.1 -> 22.6 ms a frame, run 95)
+#                                     combined stays on the card (4 ms a frame less on this
+#                                     branch, runs 130 and 131, both keeping frames)
 #   VICTORY_CARD_TOUCHED=1            a submission asks only the copies in the card's memory
 #                                     that changed, not all 3,450 of them: 1.3 ms less of the
 #                                     submitting thread's work a frame (run 124)
+#   FSR 4 `native`                    when AMD's signed amd_fidelityfx_upscaler_dx12.dll is found
+#                                     (FIDELITYFX_DIR, default: Forza Horizon 6's Steam folder):
+#                                     the title's picture made at 1920x1080 and run through PC FSR
+#                                     4.1.1 as anti-aliasing, in place of the title's own upscale
+#                                     from 1280x720. Sharp where the title's is soft, for 0 to 2 ms
+#                                     a frame here (runs 137 to 145): the card has room to spare,
+#                                     the submitting thread sets the pace. FIDELITYFX_DIR=none
+#                                     keeps the title's upscaler.
 # The light is play.sh's (VICTORY_AMBIENT=0.8, an estimate from what is on screen);
 # VICTORY_AMBIENT=constant:0.08 as a KEY=VALUE gives the same faint light everywhere instead,
 # by which people away from lamps can be made out at night.
@@ -47,8 +56,17 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
+fsr=()
+fx="${FIDELITYFX_DIR:-$HOME/.steam/steam/steamapps/common/ForzaHorizon6}"
+if [[ "$fx" != none && -f "$fx/amd_fidelityfx_upscaler_dx12.dll" ]]; then
+    p="$(realpath -m "$fx")"
+    fsr=(VICTORY_FIDELITYFX_DIR="Z:${p//\//\\}" VICTORY_FSR_VERSION=4.1.1 VICTORY_FSR_4K=native
+         DXIL_SPIRV_CONFIG=wmma_rdna3_workaround)
+    echo "FSR 4 native from $fx (FIDELITYFX_DIR=none: the title's upscaler)"
+fi
+
 exec "$here/play.sh" --start "${options[@]}" "$exe" \
     VICTORY_OUTPUT=1920x1080 \
     VICTORY_PORT_CONSTANTS=1 VICTORY_PORT_DESCRIPTORS=1 VICTORY_PORT_CBV=1 \
     VICTORY_FRAME_INTERVAL_MS=16.667 VICTORY_FRAME_INTERVAL_DRAWS=500 VICTORY_CARD_BUFFERS_MIN_KB=64 \
-    VICTORY_JOIN_PARTS_DRAWS=500 VICTORY_WC_NO_BACK=1 VICTORY_CARD_TOUCHED=1 "${settings[@]}"
+    VICTORY_JOIN_PARTS_DRAWS=500 VICTORY_WC_NO_BACK=1 VICTORY_CARD_TOUCHED=1 "${fsr[@]}" "${settings[@]}"
