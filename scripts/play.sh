@@ -8,13 +8,20 @@
 #   --rt              the title's ray-traced indirect light
 #   --windowed        a window instead of the whole screen
 #   --no-hud          without MangoHud
-#   --start           presses Enter every 4 s from 12 s to 48 s (VICTORY_KEYS, diag builds): from
-#                     the title screen to the first scene without anyone at the keyboard
+#   --start           presses Enter every 4 s from 52 s to 88 s (VICTORY_KEYS, diag builds): from
+#                     the profile screen to the first scene without anyone at the keyboard, the
+#                     world's first frame 73 s after the launch. Not sooner: the sooner the scene
+#                     starts, the oftener nobody but the heroine has a head in it, for the whole
+#                     run (docs/linux-wine.md: 4 runs of 4 at 27 s, about every other at 33 s,
+#                     with Enter from 12 s as it was, 1 of 4 at 41 s, none of 6 at 73 s).
+#                     VICTORY_KEYS=<seconds>:Enter,... as a KEY=VALUE gives other times.
 #   --wine W          proton (default): Proton's own Wine, whose write watches use the
 #                     kernel's userfaultfd and PAGEMAP_SCAN; system: Arch's Wine (not measured
 #                     since docs/linux-wine.md: what made both slow was not the write watch)
 #   --release         target/.../release instead of target/.../diag
-# Environment: PROTON (Proton folder), WINEPREFIX, GPU_NAME (adapter by name or DXGI index).
+# Environment: PROTON (Proton folder), WINEPREFIX, GPU_NAME (adapter by name or DXGI index),
+# VICTORY_SCREEN (the monitor the title covers, by its output's name as `xrandr --listmonitors`
+# gives it, e.g. HDMI-1; also as a KEY=VALUE; unset: the primary monitor).
 # What was learned under Wine, and the tools for measured runs: docs/linux-wine.md.
 # WINEDEBUG=err+all,fixme-all as a KEY=VALUE shows what Wine complains of (-all hides it).
 set -euo pipefail
@@ -60,7 +67,7 @@ winpath() { local p; p="$(realpath -m "$1")"; printf 'Z:%s' "${p//\//\\}"; }
 
 # Leftover VICTORY_* settings go, except where the files are (as play.ps1 does).
 for v in $(compgen -e | grep '^VICTORY_' || true); do
-    case "$v" in VICTORY_CONFIG|VICTORY_GAME_DIR|VICTORY_CACHE_DIR|VICTORY_DATA_DIR) ;; *) unset "$v" ;; esac
+    case "$v" in VICTORY_CONFIG|VICTORY_GAME_DIR|VICTORY_CACHE_DIR|VICTORY_DATA_DIR|VICTORY_SCREEN) ;; *) unset "$v" ;; esac
 done
 
 export VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=2 VICTORY_WIDE_BACK=1 VICTORY_CARD_REHASH_RUNS=1 \
@@ -76,7 +83,7 @@ if [[ $rt == 1 ]]; then export VICTORY_BVH_BUILDER=1; fi
 if [[ $windowed == 0 ]]; then export VICTORY_FULLSCREEN=1; fi   # borderless, the whole primary monitor
 if [[ $hud == 1 ]]; then export MANGOHUD=1; fi
 if [[ $start == 1 ]]; then
-    keys=""; for t in $(seq 12 4 48); do keys+="${keys:+,}$t:Enter"; done
+    keys=""; for t in $(seq 52 4 88); do keys+="${keys:+,}$t:Enter"; done
     export VICTORY_KEYS="$keys"
 fi                   # MangoHud's Vulkan layer (vkd3d-proton)
 
@@ -108,10 +115,11 @@ mkdir -p "$VKD3D_SHADER_CACHE_PATH"
 if [[ -n "$GPU_NAME" ]]; then export VICTORY_D3D12_ADAPTER="$GPU_NAME"; fi
 
 # Started without the session's display (ssh, a tool's shell): the session's own. Proton's Wine
-# draws through X11 and, with no display, reports a 1024x768 screen; the title then stops.
+# draws through X11 and, with no display, reports a 1024x768 screen; the title then stops. The
+# newest authority file: a session that was ended leaves its own behind.
 if [[ -z "${DISPLAY:-}" && -S /tmp/.X11-unix/X0 ]]; then
     export DISPLAY=:0
-    auth="$(ls "${XDG_RUNTIME_DIR:-/run/user/$UID}"/.mutter-Xwaylandauth.* 2>/dev/null | head -1 || true)"
+    auth="$(ls -t "${XDG_RUNTIME_DIR:-/run/user/$UID}"/.mutter-Xwaylandauth.* 2>/dev/null | head -1 || true)"
     if [[ -n "$auth" ]]; then export XAUTHORITY="$auth"; fi
 fi
 if [[ -z "${WAYLAND_DISPLAY:-}" && -S "${XDG_RUNTIME_DIR:-/run/user/$UID}/wayland-0" ]]; then
@@ -127,4 +135,20 @@ fi
 exe="$1"; shift
 [[ -f "$exe" ]] || { echo "No $exe."; exit 1; }
 for kv in "$@"; do export "$kv"; done
+# VICTORY_SCREEN: the title's borderless window over that monitor and not the primary one
+# (VICTORY_FULLSCREEN_AT: its rectangle, counted from the primary monitor's corner as Wine does).
+if [[ -n "${VICTORY_SCREEN:-}" && "${VICTORY_FULLSCREEN:-}" == 1 ]]; then
+    at="$(xrandr --listmonitors 2>/dev/null | awk -v want="$VICTORY_SCREEN" '
+        NR > 1 {
+            split($3, g, /[x+]/); sub(/\/.*/, "", g[1]); sub(/\/.*/, "", g[2])
+            if ($2 ~ /\*/) { px = g[3]; py = g[4] }
+            if ($NF == want) { w = g[1]; h = g[2]; x = g[3]; y = g[4]; found = 1 }
+        }
+        END { if (found) printf "%d,%d,%d,%d", x - px, y - py, w, h }')"
+    if [[ -n "$at" ]]; then
+        export VICTORY_FULLSCREEN_AT="$at"
+    else
+        echo "VICTORY_SCREEN=$VICTORY_SCREEN: no such monitor (xrandr --listmonitors); the primary one is used." >&2
+    fi
+fi
 exec "$WINE" "$victory" run "$(winpath "$exe")" --execute
