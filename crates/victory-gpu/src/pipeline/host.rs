@@ -1054,6 +1054,41 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    #[ignore = "requires a physical D3D12 device and local compute shader fixtures"]
+    fn compile_local_compute_fixtures() {
+        use std::{env, fs, time::Instant};
+        use victory_shader::emit::validator::Validator;
+
+        let manifest = env::var_os("VICTORY_TEST_COMPUTE_MANIFEST").expect("fixture manifest path");
+        let fixture_list = fs::read_to_string(manifest).expect("read the fixture manifest");
+        let validator_path = PathBuf::from(env::var_os("VICTORY_DXIL").expect("DXIL validator path"));
+        let mut validator = Validator::load(Some(&validator_path)).expect("load the DXIL validator");
+        let host = host().expect("the hardware fixture requires a D3D12 device");
+        let mut pipelines = Vec::new();
+        for (i, file) in fixture_list.lines().enumerate() {
+            let source = fs::read(file).expect("read a compute fixture");
+            let shader = super::super::shader("compute", &source);
+            let (valid, pipeline, elapsed) = if let Some(result) = shader.translated() {
+                let mut bytes = result.host.dxil.clone();
+                let valid = validator.validate(&mut bytes).is_ok();
+                let start = Instant::now();
+                let pipeline = HostPipeline::new(&[shader], None);
+                (valid, pipeline, start.elapsed())
+            } else {
+                (false, None, std::time::Duration::ZERO)
+            };
+            println!(
+                "compute fixture {} validated={} pipeline={} us={}",
+                i, valid, pipeline.is_some(), elapsed.as_micros()
+            );
+            pipelines.extend(pipeline);
+        }
+        assert!(!pipelines.is_empty(), "no fixture created a pipeline");
+        // SAFETY: an ordinary query on the live device.
+        unsafe { host.device.GetDeviceRemovedReason() }.expect("the fixture device is alive");
+    }
+
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };
         [outputtopology(\"triangle\")] [numthreads(1, 1, 1)]

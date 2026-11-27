@@ -2241,12 +2241,16 @@ mod tests {
                 REUSE,
                 FACTS,
                 LOADS,
+                BLOCKS,
                 FOLD | FACTS,
                 FOLD | REUSE | DEAD,
                 ALL,
             ] {
                 let mut m = random_program(seed);
                 m.optimise(passes);
+                if passes & BLOCKS != 0 {
+                    m.compact_linear_blocks();
+                }
                 for (i, want) in inputs.iter().zip(&expected) {
                     assert_eq!(&run(&m, i), want, "seed {seed}, passes {passes}");
                 }
