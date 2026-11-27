@@ -18,8 +18,8 @@
 #                                     where it gains 3 ms, and not in the intro videos, whose
 #                                     frames come three new and then the same three again joined
 #   VICTORY_WC_NO_BACK=1              what shaders write into title memory asked for as write-
-#                                     combined stays on the card (38.0 -> 33.8 ms a frame on
-#                                     this branch, runs 130 and 131)
+#                                     combined stays on the card (4 ms a frame less on this
+#                                     branch, runs 130 and 131, both keeping frames)
 #   VICTORY_CARD_TOUCHED=1            a submission asks only the copies in the card's memory
 #                                     that changed, not all 3,450 of them: 1.3 ms less of the
 #                                     submitting thread's work a frame (run 124)

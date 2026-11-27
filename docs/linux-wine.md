@@ -916,9 +916,15 @@ lock for a third of a millisecond at a time, 2,000 times a second.
     shorter); joined parts sent to the queue in one call (26.1 against 25.8 ms). A thread's
     priority asked above normal changes nothing here: every thread of the process has nice
     0, the submitting one too, since the process may not raise one (`Max nice priority 0`).
-14. This branch (the Linux branch merged with main) is slower than the Linux branch alone
-    with the same settings: 33.8 ms a frame against 26 to 28, the submitting thread working
-    27.0 ms against 23. What of main's makes the difference has not been looked for.
+14. This branch (the Linux branch merged with main) against the Linux branch alone, the same
+    settings, in turn, 200 s each and no frames kept (runs 133 to 136): 31.1 and 27.0 ms a
+    frame here, 26.6 and 27.9 there; the submitting thread working 22.2 and 19.1 ms here,
+    20.5 and 20.6 there. No difference is shown: this branch's two runs lie 4 ms apart.
+    (A first version of this item said this branch was 6 ms slower. That compared runs that
+    kept every eighth frame of the world as a picture, `VICTORY_CAPTURE_WORLD=1`, with runs
+    that did not: keeping them costs several ms a frame, 33.8 ms with against 27.0 to 31.1
+    without on this branch. The figures of item 12 are both from runs that kept them, so
+    their difference stands and their level is some ms too high.)
 
 ## Tools
 
