@@ -897,6 +897,28 @@ lock for a third of a millisecond at a time, 2,000 times a second.
     27.9 with (runs 90 to 93). The frames of the world kept of a run with it are whole
     pictures, faces too (run 96), and so it looked on the screen: `scripts/play-1080p.sh`
     sets it. One run of each on this branch, and the first scene alone.
+13. Where the submitting thread's time goes, and `VICTORY_CARD_TOUCHED=1`. The card is not
+    what holds the frame back any more: its core runs at 2,460 MHz and it draws 127 to 133 W
+    of the 220 it may (`card-log.sh`, runs 119 to 128), while the submitting thread works
+    23 to 24 ms of a frame of 26 to 28. Sampled every 5 ms (`VICTORY_PROFILE`, run 123) that
+    thread is parked 35 % of the time (waiting for its helpers or for work), 8.6 % in
+    `NtGetWriteWatch`, 4.2 % in the diagnostics' `GetThreadTimes`, and 6.9 % in one function
+    of ours: `shadow::card_dirty`, which at every submission, 28 a frame, asked each of the
+    3,450 copies in the card's memory whether it had changed, where some 130 had.
+    `VICTORY_CARD_TOUCHED=1` asks only the copies that were marked as changed. By turns of
+    10 s in one run (run 124): the thread's time for these copies 2.60 -> 1.30 ms a frame,
+    its work 23.7 -> 22.6 ms; the frame 27.2 -> 26.0 ms (median of five phases' medians each
+    side), which is within what the scene moves it by from one phase to the next (2 to
+    5 ms), so the frame's gain is not shown, the thread's is. The picture as before, with it
+    on for a whole run too (run 129). `scripts/play-1080p.sh` sets it.
+
+    Tried the same day and not kept, each a run or two: the Series S profile (27.9 ms
+    against 28.2, and blocks of pixels on faces and arms; runs 119 and 120); two presents
+    in the line (`VICTORY_SUBMIT_FRAMES=2`: the title's wait at presents 10.5 -> 0.0 ms, the
+    frame no shorter, run 121); joined parts sent to the queue in one call (26.1 against
+    25.8 ms, run 118). A thread's priority asked above normal changes nothing here: every
+    thread of the process has nice 0, the submitting one too, since the process may not
+    raise one (`Max nice priority 0`).
 
 ## Tools
 

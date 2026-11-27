@@ -19,6 +19,9 @@
 #                                     frames come three new and then the same three again joined
 #   VICTORY_WC_NO_BACK=1              what shaders write into title memory asked for as write-
 #                                     combined stays on the card (25.1 -> 22.6 ms a frame, run 95)
+#   VICTORY_CARD_TOUCHED=1            a submission asks only the copies in the card's memory
+#                                     that changed, not all 3,450 of them: 1.3 ms less of the
+#                                     submitting thread's work a frame (run 124)
 # The light is play.sh's (VICTORY_AMBIENT=0.8, an estimate from what is on screen);
 # VICTORY_AMBIENT=constant:0.08 as a KEY=VALUE gives the same faint light everywhere instead,
 # by which people away from lamps can be made out at night.
@@ -48,4 +51,4 @@ exec "$here/play.sh" --start "${options[@]}" "$exe" \
     VICTORY_OUTPUT=1920x1080 \
     VICTORY_PORT_CONSTANTS=1 VICTORY_PORT_DESCRIPTORS=1 VICTORY_PORT_CBV=1 \
     VICTORY_FRAME_INTERVAL_MS=16.667 VICTORY_FRAME_INTERVAL_DRAWS=500 VICTORY_CARD_BUFFERS_MIN_KB=64 \
-    VICTORY_JOIN_PARTS_DRAWS=500 VICTORY_WC_NO_BACK=1 "${settings[@]}"
+    VICTORY_JOIN_PARTS_DRAWS=500 VICTORY_WC_NO_BACK=1 VICTORY_CARD_TOUCHED=1 "${settings[@]}"
