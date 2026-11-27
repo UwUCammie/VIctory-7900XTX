@@ -738,6 +738,24 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     spent.end();
 }
 
+/// Records a range that no earlier single range contains. Starts and ends
+/// both increase in the map, so the last start at or before `first` has the
+/// farthest end there. Removing contained entries keeps that property
+/// without changing the order or contents of the actual kernel requests.
+fn record_uncovered(earlier: &mut BTreeMap<usize, usize>, first: usize, last: usize) -> bool {
+    if earlier.range(..=first).next_back().is_some_and(|(_, &end)| end >= last) {
+        return false;
+    }
+    while let Some((&start, &end)) = earlier.range(first..).next() {
+        if end > last {
+            break;
+        }
+        earlier.remove(&start);
+    }
+    earlier.insert(first, last);
+    true
+}
+
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
 /// asking stands.
 fn ask_rest(ranges: &[(usize, usize)], held: bool) {
@@ -754,6 +772,7 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
     let mut written = Vec::new();
     // Those not held by an asking ahead, each once.
     let mut alone_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut earlier = BTreeMap::new();
     let mut held_ahead = Ahead::new();
     held_ahead.set(std::mem::take(&mut ahead));
     for &(start, end) in ranges {
@@ -761,7 +780,7 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !held_ahead.holds(first, last) && !alone_ranges.iter().any(|&(a, b)| a <= first && last <= b) {
+        if !held_ahead.holds(first, last) && record_uncovered(&mut earlier, first, last) {
             alone_ranges.push((first, last));
         }
     }
@@ -3349,6 +3368,15 @@ fn writable(at: usize) -> bool {
 #[cfg(test)]
 mod parts_tests {
     use super::*;
+
+    #[test]
+    fn individual_earlier_ranges_determine_which_queries_are_needed() {
+        let input = [(8, 10), (4, 7), (5, 9), (4, 9), (6, 8), (8, 12), (4, 12), (4, 9), (4, 13)];
+        let mut earlier = BTreeMap::new();
+        let due: Vec<_> = input.into_iter().filter(|&(a, b)| record_uncovered(&mut earlier, a, b)).collect();
+        assert_eq!(due, [(8, 10), (4, 7), (5, 9), (4, 9), (8, 12), (4, 12), (4, 13)]);
+        assert_eq!(earlier.into_iter().collect::<Vec<_>>(), [(4, 13)]);
+    }
 
     #[test]
     fn ranges_asked_ahead_hold_what_lies_in_one_of_them() {
