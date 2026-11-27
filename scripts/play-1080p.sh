@@ -9,6 +9,8 @@
 #   VICTORY_PORT_DESCRIPTORS=1        card where the title writes it; patches 2 and 5 (6 and 7
 #   VICTORY_PORT_CBV=1                gain nothing under Wine)
 #   VICTORY_FRAME_INTERVAL_MS=16.667  the title let above its 30 frames a second
+#   VICTORY_FRAME_INTERVAL_DRAWS=500  ... in the world only: the opening animation and videos tick
+#                                     at the title's own 30 (at 60, a frame in fourteen came twice)
 #   VICTORY_CARD_BUFFERS_MIN_KB=64    every title buffer's copy in the card's memory (4 MiB and
 #                                     more by default on a 16 GB card): 13.2 GiB of it in use
 #   VICTORY_JOIN_PARTS_DRAWS=500      a frame's submissions joined (play.sh's VICTORY_JOIN_PARTS=8)
@@ -17,13 +19,11 @@
 #                                     frames come three new and then the same three again joined
 #   VICTORY_WC_NO_BACK=1              what shaders write into title memory asked for as write-
 #                                     combined stays on the card (25.1 -> 22.6 ms a frame, run 95)
-# and one for the picture:
-#   VICTORY_AMBIENT=constant:0.08  the same faint light everywhere, so that people and the
-#                                  inside of cars can be made out at night (play.sh's 0.8 is an
-#                                  estimate from what is on screen, near black there);
-#                                  constant:0.3 is plain to see and looks like an overcast day
+# The light is play.sh's (VICTORY_AMBIENT=0.8, an estimate from what is on screen);
+# VICTORY_AMBIENT=constant:0.08 as a KEY=VALUE gives the same faint light everywhere instead,
+# by which people away from lamps can be made out at night.
 #   scripts/play-1080p.sh [play.sh options] [KEY=VALUE ...]
-# A KEY=VALUE given here wins over these (VICTORY_AMBIENT=0.8, VICTORY_PORT_CONSTANTS=0 ...).
+# A KEY=VALUE given here wins over these (VICTORY_PORT_CONSTANTS=0, VICTORY_WC_NO_BACK=0 ...).
 # VICTORY_PORT_CBV=1 has shaders of its own in the cache: the first launch with it translates
 # them as it goes and stutters, unless they were made ahead (warm-set.sh VICTORY_PORT_CBV=1,
 # two minutes: docs/linux-wine.md, Tools).
@@ -47,5 +47,5 @@ done
 exec "$here/play.sh" --start "${options[@]}" "$exe" \
     VICTORY_OUTPUT=1920x1080 \
     VICTORY_PORT_CONSTANTS=1 VICTORY_PORT_DESCRIPTORS=1 VICTORY_PORT_CBV=1 \
-    VICTORY_FRAME_INTERVAL_MS=16.667 VICTORY_CARD_BUFFERS_MIN_KB=64 \
-    VICTORY_JOIN_PARTS_DRAWS=500 VICTORY_WC_NO_BACK=1 VICTORY_AMBIENT=constant:0.08 "${settings[@]}"
+    VICTORY_FRAME_INTERVAL_MS=16.667 VICTORY_FRAME_INTERVAL_DRAWS=500 VICTORY_CARD_BUFFERS_MIN_KB=64 \
+    VICTORY_JOIN_PARTS_DRAWS=500 VICTORY_WC_NO_BACK=1 "${settings[@]}"
