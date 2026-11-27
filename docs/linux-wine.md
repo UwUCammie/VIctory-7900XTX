@@ -337,11 +337,16 @@ looked for.
 
 What was changed:
 
-- **`VICTORY_COMPUTE_WAIT_MS`** (`compute_budget` in `pipeline/make.rs`; 10 s under Wine,
-  `0`: as before; on Windows as before unless set): the first use of a compute pass waits for
-  its pipeline by a budget of its own, all of a frame's waits ending together, and its
-  pipeline is made before the others'. No compute pass was dropped in any run with it, and
-  none waited a tenth of a second.
+- **`VICTORY_COMPUTE_WAIT_MS`** (`compute_budget` in `pipeline/make.rs`; half a second
+  under Wine, `0`: as before; on Windows as before unless set): the first use of a compute
+  pass waits for its pipeline by a budget of its own, all of a frame's waits ending together,
+  and its pipeline is made before the others'. In the runs below it was 10 s: no compute pass
+  was dropped in any of them, and none waited a tenth of a second, vkd3d-proton's cache being
+  there. With every cache empty (the layer's, vkd3d-proton's, Mesa's; runs 101 and 102, and
+  UwUCammie's on pull request 440) 10 s froze the start: 95 waits of a second or more, the
+  longest 10 s, some 25 s of frames of 5 s, a minute to a usual frame; half a second: none
+  over 501 ms, 35 s. Faces were there in both, one run each; a pass that runs once can still
+  be dropped in such a first run (798 compute first uses were, at half a second).
 - **`VICTORY_LIBRARY_NULL`** (`open` in `pipeline/library.rs`; on under Wine, `0`: as
   before): an empty pipeline library is asked for with no address. vkd3d-proton refuses a
   blob of no bytes at an address that is not null, which is what an empty slice has: "no host
@@ -495,6 +500,12 @@ two runs of the same thing lie 2 % apart (40.5 and 41.3 ms, runs 30 and 36).
   frequency governor (`powersave`, `amd-pstate-epp`) is not holding anything back.
 
 ### Let above 30
+
+(The opening animation and videos are made for 30: ticked at 60, 7 frames of 100 in a row of
+the animation were the frame before again, and 58 of 100 of a video of 24 pictures a second
+(run 98). `VICTORY_FRAME_INTERVAL_DRAWS=500` ticks at the title's own 33.3 ms until a frame
+runs 500 draws, and again after thirty frames in a row with fewer: 98 new frames of 100 and
+none twice, the world as before (run 100). `scripts/play-1080p.sh` sets it.)
 
 With the five patches the frame was the title's own 33.3 ms (run 34). With
 `VICTORY_FRAME_INTERVAL_MS=16.667` as well (run 40): 31.2 ms a frame (27.3 to 51.8), 32.0
@@ -848,6 +859,12 @@ lock for a third of a millisecond at a time, 2,000 times a second.
    what the 1,540 dispatches are; a card with room for every buffer.
 10. Everything of 2026-11-27 was measured in the title's first scene, a cutscene at night.
     Not in play, not by day, not in traffic.
+
+11. Lips do not move when people speak: the heroine's mouth is shut in 21 frames in a row of
+    three of her lines, eyes and head moving (run h02). In the frame recorded in run 68 the
+    face deformer's shared input (`title buffer 0xda62c8580+0x104000`, 1 MiB) is all zeros on
+    the card and in the copy of title memory, and nothing writes it in the frame. Not the
+    heads' cause (there the card and title memory differed). Not looked into.
 
 ## Tools
 
