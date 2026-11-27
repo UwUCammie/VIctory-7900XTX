@@ -560,6 +560,36 @@ mod tests {
     }
 
     #[test]
+    fn a_run_uses_its_translation_when_cache_publication_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [11u8; 32];
+        let container = b"generated cache input".as_slice();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        let converter = Translate { translate, source: SOURCE, translated: OnceLock::new() };
+        let input = [&build[..], container].concat();
+        let key = victory_pipeline::CacheKey::new(&converter, &input);
+        let blocked = cache.path_for(&key);
+        // A file cannot be published over a directory, even as administrator.
+        std::fs::create_dir_all(&blocked).unwrap();
+
+        assert_eq!(cached(&cache, &build, container, translate, false), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert!(blocked.is_dir());
+        assert_eq!(std::fs::read_dir(blocked.parent().unwrap()).unwrap().count(), 1);
+
+        std::fs::remove_dir(&blocked).unwrap();
+        assert_eq!(cached(&cache, &build, container, translate, false), Ok(shader()));
+        assert_eq!(cached(&cache, &build, container, translate, false), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+        assert!(blocked.is_file());
+    }
+
+    #[test]
     fn entries_round_trip_and_reject_damage() {
         let bytes = encode(&shader(), "made by");
         assert_eq!(decode(&bytes), Some((shader(), b"made by".to_vec())));
