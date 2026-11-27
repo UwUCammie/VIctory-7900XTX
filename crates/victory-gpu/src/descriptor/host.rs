@@ -1921,6 +1921,12 @@ impl HostHeap {
         self.count
     }
 
+    /// Leave some space for lists that need to finish before the queue can
+    /// submit them. Called between thin recording chunks.
+    pub(crate) fn dynamic_pressure(&self) -> bool {
+        self.free.load(std::sync::atomic::Ordering::Relaxed) < self.dynamic.saturating_mul(5) / 8
+    }
+
     /// Writes the word of the table of element strides for the dynamic slot
     /// `index`, which holds `view` of a table made afresh: shaders ask it
     /// whether a typed view in a table is of an integer format
