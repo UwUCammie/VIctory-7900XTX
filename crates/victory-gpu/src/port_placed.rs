@@ -371,3 +371,86 @@ pub(crate) fn log() {
         s[5],
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory as mem;
+
+    struct Reservation {
+        at: *mut u8,
+        bytes: usize,
+        registered: bool,
+    }
+
+    impl Drop for Reservation {
+        fn drop(&mut self) {
+            if self.registered {
+                release(self.at as usize, self.bytes);
+            }
+            // SAFETY: this test made the reservation and retired any placed heap.
+            unsafe { mem::VirtualFree(self.at.cast(), 0, mem::MEM_RELEASE) };
+        }
+    }
+
+    #[test]
+    #[ignore = "requires vkd3d-proton and an active Vulkan placed-mapping layer"]
+    fn preferred_adapter_placed_heap_round_trip() {
+        assert!(on(), "set VICTORY_PORT_CONSTANTS=1 and VICTORY_PORT_PLACED=1");
+        const BYTES: usize = 8 << 20;
+        let host = crate::host::host().expect("the selected D3D12 device");
+        let memory = prepare(BYTES).expect("prepare a D3D12 heap with its Vulkan address reserved");
+        eprintln!("prepared D3D12 heap and reserved its old Vulkan CPU mapping");
+
+        let at = (0x4000_0000usize..0x7000_0000)
+            .step_by(BYTES)
+            .find_map(|hint| {
+                // SAFETY: request new pages at a low address; on overlap Windows refuses.
+                let ptr = unsafe {
+                    mem::VirtualAlloc(
+                        hint as *const c_void,
+                        BYTES,
+                        mem::MEM_RESERVE | mem::MEM_COMMIT,
+                        mem::PAGE_READWRITE,
+                    )
+                };
+                (!ptr.is_null()).then_some(ptr.cast::<u8>())
+            })
+            .expect("a free low CPU address for the test reservation");
+        let mut region = Reservation { at, bytes: BYTES, registered: false };
+        let base = at as usize;
+        map(&memory, base).expect("map the Vulkan allocation at the test reservation");
+        register(memory, base);
+        region.registered = true;
+        assert!(crate::port::placed_touches(base as u64, BYTES as u64));
+
+        let start = base + K64 as usize + 64;
+        let len = K64 as usize + 512;
+        let placed = crate::port::place_for(start as u64, len as u64, false)
+            .expect("place a buffer across a 64 KiB boundary in the registered heap");
+        assert_eq!(placed.bias, 64);
+        let expected: Vec<u8> = (0..len).map(|i| (i * 7 + (i >> 8) + (i >> 16)) as u8).collect();
+        let mut rig = crate::inplace::Rig::new(&host.device).unwrap();
+        // SAFETY: live CPU mapping, the copied range is inside the reservation.
+        unsafe { std::ptr::copy_nonoverlapping(expected.as_ptr(), start as *mut u8, len) };
+        let got = rig.fetch(&placed.buffer, placed.bias, len).expect("GPU readback");
+        assert!(
+            got == expected,
+            "CPU to GPU first mismatch at {:?}",
+            got.iter().zip(&expected).position(|(a, b)| a != b),
+        );
+        let marker = [0x5a; 256];
+        let offset = K64 - 128;
+        rig.store(&placed.buffer, placed.bias + offset, &marker).expect("GPU store");
+        // SAFETY: fence complete and the placed bytes are still mapped at the CPU address.
+        let cpu = unsafe { std::slice::from_raw_parts((start + offset as usize) as *const u8, marker.len()) };
+        assert_eq!(cpu, marker, "GPU to CPU");
+        drop((rig, placed));
+
+        assert_eq!(release(base, BYTES), BYTES as u64);
+        region.registered = false;
+        assert!(!crate::port::placed_touches(base as u64, BYTES as u64));
+        drop(region);
+        eprintln!("D3D12 placed heap verified CPU to GPU and GPU to CPU");
+    }
+}
