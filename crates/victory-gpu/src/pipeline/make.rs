@@ -47,6 +47,7 @@ pub(crate) struct Pending {
     waiter_hint: AtomicBool,
     /// Measured only with the diagnostic queue trace enabled.
     requested_at: OnceLock<Instant>,
+    recorded_at: OnceLock<Instant>,
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
@@ -90,6 +91,7 @@ impl Pending {
             queue_state: AtomicU8::new(NOT_QUEUED),
             waiter_hint: AtomicBool::new(false),
             requested_at: OnceLock::new(),
+            recorded_at: OnceLock::new(),
             was_slow: AtomicBool::new(false),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
@@ -100,6 +102,10 @@ impl Pending {
 
     pub(super) fn key(&self) -> &str {
         &self.key
+    }
+
+    pub(super) fn may_record_compute(&self) -> bool {
+        self.compute && !self.used.load(Ordering::Relaxed) && !self.lost.load(Ordering::Relaxed)
     }
 
     /// Whether its first use waits by a budget of its own and its making
@@ -467,6 +473,14 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
+        if let Some(recorded) = p.recorded_at.get() {
+            tracing::info!(
+                us = recorded.elapsed().as_micros() as u64,
+                ready = p.made.get().is_some_and(Option::is_some),
+                shaders = ?p.shaders,
+                "recorded compute pipeline reached replay"
+            );
+        }
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
@@ -525,6 +539,39 @@ pub(crate) fn early(p: &Arc<Pending>) {
 
 fn within_early_compute_limit(bytes: usize, limit: usize) -> bool {
     bytes != 0 && bytes <= limit
+}
+
+fn recorded_compute_settings() -> (bool, bool) {
+    static SETTINGS: OnceLock<(bool, bool)> = OnceLock::new();
+    *SETTINGS.get_or_init(|| {
+        let enabled = std::env::var_os("VICTORY_EARLY_RECORDED_COMPUTE").is_some_and(|v| v == "1");
+        let trace = std::env::var_os("VICTORY_RECORDED_COMPUTE_TRACE").is_some_and(|v| v == "1");
+        tracing::info!(enabled, trace, "recorded compute pipeline lookahead");
+        (enabled, trace)
+    })
+}
+
+pub(super) fn track_recorded_compute() -> bool {
+    let (enabled, trace) = recorded_compute_settings();
+    enabled || trace
+}
+
+/// The title recorded a dispatch that uses this pipeline. Give the existing
+/// early queue a chance to make it before replay asks for the pipeline.
+pub(super) fn recorded_compute(p: &Arc<Pending>) {
+    if !p.may_record_compute() {
+        return;
+    }
+    let (enabled, trace) = recorded_compute_settings();
+    if trace {
+        p.recorded_at.get_or_init(Instant::now);
+    }
+    if enabled && p.queue_state.load(Ordering::Relaxed) == NOT_QUEUED
+        && workers() && enqueue(p, EARLY)
+    {
+        static STARTED: std::sync::Once = std::sync::Once::new();
+        STARTED.call_once(|| tracing::info!("first recorded compute pipeline queued before replay"));
+    }
 }
 
 /// Whether the frame's budget is one for all threads together: a thread
@@ -837,6 +884,12 @@ fn start(p: &Arc<Pending>, priority: u8) {
         }
         return;
     }
+    enqueue(p, priority);
+}
+
+/// Queue work only when a worker can take it. Recording a thin command
+/// never uses the synchronous fallback in `start`.
+fn enqueue(p: &Arc<Pending>, priority: u8) -> bool {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(new) = queue.push(p, priority) {
         if priority == REQUESTED && trace_request_latency() {
@@ -848,7 +901,9 @@ fn start(p: &Arc<Pending>, priority: u8) {
         // (One woken could be a worker that takes passes over the screen
         // alone: it would leave the pipeline to nobody.)
         AVAILABLE.notify_all();
+        return true;
     }
+    false
 }
 
 /// Workers that make passes over the screen alone, besides the others.

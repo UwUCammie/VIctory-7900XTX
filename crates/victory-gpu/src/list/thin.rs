@@ -64,6 +64,7 @@ pub(crate) fn wanted() -> bool {
 pub(super) struct Front {
     recording: Option<Arc<Recording>>,
     words: Vec<u64>,
+    compute: Option<crate::pipeline::RecordedCompute>,
     closed: bool,
     submitted: bool,
 }
@@ -84,6 +85,7 @@ impl Front {
             recording.abandoned.store(true, Release);
         }
         self.words.clear();
+        self.compute = None;
     }
 
     /// Begins a recording, with `pipeline` bound.
@@ -92,7 +94,20 @@ impl Front {
         self.recording = Some(Arc::new(Recording::new(kind)));
         self.closed = false;
         self.submitted = false;
+        self.track_pipeline(pipeline);
         self.put(RESET, &[pipeline as u64]);
+    }
+
+    fn track_pipeline(&mut self, pipeline: This) {
+        if !self.closed && self.recording.is_some() {
+            self.compute = crate::pipeline::recorded_compute(pipeline);
+        }
+    }
+
+    fn request_compute(&mut self) {
+        if let Some(pipeline) = self.compute.take() {
+            pipeline.requested();
+        }
     }
 
     #[inline]
@@ -155,6 +170,7 @@ impl Front {
         }
         self.put(CLOSE, &[]);
         self.closed = true;
+        self.compute = None;
         self.hand_over();
     }
 }
@@ -458,11 +474,11 @@ plain! {
     GRAPHICS_CONSTANT graphics_constant = state::graphics_constant, (slot: u32, value: u32, offset: u32);
     COMPUTE_VIEW compute_view = state::compute_view, (slot: u32, address: u64);
     GRAPHICS_VIEW graphics_view = state::graphics_view, (slot: u32, address: u64);
-    SET_PIPELINE set_pipeline = super::set_pipeline, (pipeline: This);
+    SET_PIPELINE record_pipeline = super::set_pipeline, (pipeline: This);
     DRAW draw = state::draw, (vertices: u32, instances: u32, first: u32, first_instance: u32);
     DRAW_INDEXED draw_indexed = state::draw_indexed, (indices: u32, instances: u32, first: u32, base: i32, first_instance: u32);
-    DISPATCH dispatch = state::dispatch, (x: u32, y: u32, z: u32);
-    DISPATCH_X dispatch_x = super::dispatch_x, (x: u32, y: u32, z: u32, flags: u32);
+    DISPATCH record_dispatch = state::dispatch, (x: u32, y: u32, z: u32);
+    DISPATCH_X record_dispatch_x = super::dispatch_x, (x: u32, y: u32, z: u32, flags: u32);
     DISPATCH_MESH dispatch_mesh = state::dispatch_mesh, (x: u32, y: u32, z: u32);
     DISPATCH_MESH_X dispatch_mesh_x = state::dispatch_mesh_x, (x: u32, flags: u64, indirect: u64, payload: u64);
     COPY_BUFFER copy_buffer_region = super::copy_buffer_region, (dst: This, dst_offset: u64, src: This, src_offset: u64, len: u64);
@@ -471,12 +487,50 @@ plain! {
     COPY_MEMORY copy_memory = super::copy_memory, (dst: u64, src: u64, len: u64, flags: u32);
     RESOLVE resolve = super::resolve, (dst: This, dst_sub: u32, src: This, src_sub: u32, format: u32);
     RESOLVE_QUERIES resolve_queries = super::resolve_queries, (heap: This, kind: u32, first: u32, count: u32, buffer: This, offset: u64);
-    EXECUTE_INDIRECT execute_indirect = super::execute_indirect, (signature: This, max: u32, arguments: This, offset: u64, count: This, count_offset: u64);
+    EXECUTE_INDIRECT record_execute_indirect = super::execute_indirect, (signature: This, max: u32, arguments: This, offset: u64, count: This, count_offset: u64);
     WRITE32 write32 = super::write32, (address: u64, value: u32, flush: u32, flags: u32);
     WRITE64 write64 = super::write64, (address: u64, value: u64, flush: u32, flags: u32);
     WAIT_VALUE wait_value = super::wait_value, (address: u64, comparison: u32, reference: u64);
     WAIT_VALUE64 wait_value64 = super::wait_value64, (address: u64, comparison: u32, reference: u64);
     SYNC sync = super::sync, (flags: u32, control: u32, address: u64, size: u64);
+}
+
+extern "system" fn set_pipeline(this: This, pipeline: This) {
+    front(this).track_pipeline(pipeline);
+    record_pipeline(this, pipeline);
+}
+
+extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
+    if x != 0 && y != 0 && z != 0 {
+        front(this).request_compute();
+    }
+    record_dispatch(this, x, y, z);
+}
+
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
+    if x != 0 && y != 0 && z != 0 {
+        front(this).request_compute();
+    }
+    record_dispatch_x(this, x, y, z, flags);
+}
+
+extern "system" fn execute_indirect(
+    this: This,
+    signature: This,
+    max: u32,
+    arguments: This,
+    offset: u64,
+    count: This,
+    count_offset: u64,
+) {
+    let front = front(this);
+    if max != 0 && front.compute.is_some()
+        && matches!(crate::signature::layout(signature),
+            Some((_, [[INDIRECT_DISPATCH | INDIRECT_DISPATCH_SINGLE, ..]])))
+    {
+        front.request_compute();
+    }
+    record_execute_indirect(this, signature, max, arguments, offset, count, count_offset);
 }
 
 const fn after(n: u64) -> u64 {
@@ -933,6 +987,19 @@ mod tests {
         // SAFETY: as above.
         assert_eq!(unsafe { *at::<[u32; 3]>(&w[1..], 2, 3) }, [7, 8, 9]);
         assert!(at::<u32>(&w[1..], 2, 0).is_null());
+    }
+
+    #[test]
+    fn the_compute_hooks_keep_dispatch_packets_unchanged() {
+        let mut list = super::super::boxed(0, std::ptr::null(), true);
+        list.thin.begin(0, std::ptr::null());
+        let this = std::ptr::from_mut(&mut *list).cast_const().cast();
+        dispatch(this, 4, 3, 2);
+        dispatch_x(this, 1, 0, 2, 8);
+        assert_eq!(&list.thin.words[2..], &[
+            Plain::DISPATCH as u64 | 3 << 16, 4, 3, 2,
+            Plain::DISPATCH_X as u64 | 4 << 16, 1, 0, 2, 8,
+        ]);
     }
 
     /// A view's record is the one at the call, also if its slot is written

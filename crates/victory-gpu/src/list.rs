@@ -1907,6 +1907,11 @@ extern "system" fn draw(_: This) {
     count_draw();
 }
 
+#[cfg(windows)]
+const INDIRECT_DISPATCH: u32 = 2;
+#[cfg(windows)]
+const INDIRECT_DISPATCH_SINGLE: u32 = 105;
+
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
 /// offset)`. The title's signatures (title+0x2479466, 2026-11-24)
 /// hold one argument each: draw (stride 16), indexed draw (20), dispatch
@@ -1937,9 +1942,7 @@ extern "system" fn execute_indirect(
     if let ([[kind, ..]], Some(address)) = (args, address)
         && (count.is_null() || counter.is_some())
     {
-        const DISPATCH: u32 = 2;
-        const DISPATCH_SINGLE: u32 = 105;
-        let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        let kind = if *kind == INDIRECT_DISPATCH_SINGLE { INDIRECT_DISPATCH } else { *kind };
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });

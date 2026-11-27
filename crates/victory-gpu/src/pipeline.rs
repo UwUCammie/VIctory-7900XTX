@@ -440,6 +440,31 @@ fn pipeline<'a>(this: This) -> &'a Pipeline {
     unsafe { &*this.cast::<Pipeline>() }
 }
 
+/// Records early demand without retaining a title pipeline until the list
+/// is reset. The worker gets its own reference once work is queued.
+#[cfg(windows)]
+pub(crate) struct RecordedCompute(std::sync::Weak<make::Pending>);
+
+#[cfg(windows)]
+impl RecordedCompute {
+    pub(crate) fn requested(self) {
+        if let Some(p) = self.0.upgrade() {
+            make::recorded_compute(&p);
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn recorded_compute(this: This) -> Option<RecordedCompute> {
+    if !make::track_recorded_compute() || this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    // The builder is enabled and prepared as a group in replay.
+    (!p.builder && p.host.may_record_compute())
+        .then(|| RecordedCompute(Arc::downgrade(&p.host)))
+}
+
 /// List method: logs each pipeline's shaders the first time a list binds
 /// it, so a run lists the shaders its frames need first.
 pub(crate) fn bound(this: This) {
