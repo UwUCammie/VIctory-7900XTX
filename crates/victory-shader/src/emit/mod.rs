@@ -1639,10 +1639,12 @@ mod tests {
         let early = emitted(&color, el("SV_Target", 16, 4), 0x1050);
         assert_ne!(late, early, "the early-depth flag changed nothing");
         #[cfg(windows)]
-        if let Ok(mut v) = super::validator::Validator::load(
-            super::validator::Validator::default_path().as_deref(),
-        ) {
-            v.validate(&mut early.clone()).unwrap();
+        match super::validator::Validator::load(super::validator::Validator::default_path().as_deref()) {
+            Ok(mut validator) => {
+                validator.validate(&mut early.clone()).unwrap();
+                eprintln!("DXIL validator accepted generated early-depth pixel program");
+            }
+            Err(error) => assert!(std::env::var_os("VICTORY_DXIL").is_none(), "{error}"),
         }
         let late = emitted(&depth, el("SV_Depth", 17, 1), 0x51);
         let early = emitted(&depth, el("SV_Depth", 17, 1), 0x1051);
