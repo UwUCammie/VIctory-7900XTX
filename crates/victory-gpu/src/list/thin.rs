@@ -171,7 +171,7 @@ impl Front {
         }
         self.put(CLOSE, &[]);
         self.closed = true;
-        self.compute = None;
+        self.pipeline = None;
         self.hand_over();
     }
 }
