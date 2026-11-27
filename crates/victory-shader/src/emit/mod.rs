@@ -453,43 +453,76 @@ pub struct UserData {
 /// a program: with that on for every program, 69 compute programs that
 /// already translated came out changed (`CS_RaytracingResolve`, ...).
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
-    match translate_plain(container) {
-        Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
-            lower::with_first_half_pairs(|| translate_plain(container))
+    ParsedShader::parse(container)?.translate()
+}
+
+/// A console shader parsed once for translation and for runtime bindings.
+pub struct ParsedShader<'a> {
+    bytes: &'a [u8],
+    container: Container<'a>,
+    programs: Option<Vec<NativeProgram>>,
+}
+
+impl<'a> ParsedShader<'a> {
+    /// Parse the container and extract its programs for later use.
+    pub fn parse(bytes: &'a [u8]) -> Result<Self, ShaderError> {
+        let container = Container::parse(bytes)?;
+        let programs = container
+            .part(FourCC::DXIL)
+            .or(container.part(FourCC::ACCC))
+            .map(|part| crate::native_programs(part.data))
+            .transpose()?;
+        Ok(Self {
+            bytes,
+            container,
+            programs,
+        })
+    }
+
+    /// The original bytes, including any padding, for the shader cache key.
+    pub fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// The console programs and their resource metadata.
+    pub fn into_programs(self) -> Vec<NativeProgram> {
+        self.programs.unwrap_or_default()
+    }
+
+    /// Translate the first supported stage with the usual retry rules.
+    pub fn translate(&self) -> Result<HostShader, ShaderError> {
+        let native = self
+            .programs
+            .as_ref()
+            .ok_or(ShaderError::Malformed("no DXIL part"))?
+            .iter()
+            .find(|p| matches!(p.stage, HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms))
+            .ok_or(ShaderError::Unsupported {
+                offset: 0,
+                what: "a container without a vertex, pixel, compute or mesh program",
+            })?;
+        let compile = || translate_plain(&self.container, native);
+        match compile() {
+            Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
+                lower::with_first_half_pairs(compile)
+            }
+            Err(ShaderError::Unsupported { what, .. }) if what == lower::MASK_ELSEWHERE => {
+                lower::with_mask_ops_on_numbers(compile)
+            }
+            other => other,
         }
-        Err(ShaderError::Unsupported { what, .. }) if what == lower::MASK_ELSEWHERE => {
-            lower::with_mask_ops_on_numbers(|| translate_plain(container))
-        }
-        other => other,
     }
 }
 
-fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
-    let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .or(c.part(FourCC::ACCC))
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
-        .into_iter()
-        .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
-            )
-        })
-        .ok_or(ShaderError::Unsupported {
-            offset: 0,
-            what: "a container without a vertex, pixel, compute or mesh program",
-        })?;
-    let p = crate::spill::build(&native)?;
+fn translate_plain(c: &Container, native: &NativeProgram) -> Result<HostShader, ShaderError> {
+    let p = crate::spill::build(native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
-    let io = io::raise(&p, &native)?;
+    let io = io::raise(&p, native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit(c, native, &p, &st, &io, &res)
 }
 
 /// [`emit`] with the same second tries as [`translate`] (first halves of
@@ -1043,6 +1076,19 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    #[test]
+    fn parsed_shader_keeps_cache_padding_and_reports_a_missing_program_part() {
+        let mut bytes = crate::dxbc::build(&[]);
+        bytes.extend_from_slice(&[0, 1, 2, 3]);
+        let parsed = super::ParsedShader::parse(&bytes).unwrap();
+        assert_eq!(parsed.bytes(), bytes);
+        assert!(matches!(
+            parsed.translate(),
+            Err(crate::ShaderError::Malformed("no DXIL part"))
+        ));
+        assert!(parsed.into_programs().is_empty());
+    }
 
     /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
     /// is installed.

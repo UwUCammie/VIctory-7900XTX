@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 const FORMAT: u32 = 2;
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{HostShader, ParsedShader, StaticSampler, UserData};
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
 
@@ -178,11 +178,11 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 
 /// The translation of a console shader container, from the cache when
 /// there is one.
-pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+pub(crate) fn host_shader(shader: &ParsedShader<'_>) -> Result<HostShader, String> {
+    let translate = |_: &[u8]| shader.translate().map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate, refresh_in_runs()),
-        None => translate(container),
+        Some(cache) => cached(cache, &build(), shader.bytes(), translate, refresh_in_runs()),
+        None => shader.translate().map_err(|e| e.to_string()),
     }
 }
 
