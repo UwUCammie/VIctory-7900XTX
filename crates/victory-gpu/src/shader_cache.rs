@@ -146,6 +146,9 @@ fn build() -> [u8; 32] {
             0 => {}
             stages => bytes.extend_from_slice(format!("VICTORY_SINGLE_LATCH={stages}").as_bytes()),
         }
+        if victory_shader::emit::shared_box_loads() {
+            bytes.extend_from_slice(b"VICTORY_BVH_SHARED_BOX_LOAD=1");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();

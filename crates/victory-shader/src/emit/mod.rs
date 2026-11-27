@@ -201,6 +201,13 @@ pub fn builder_bounds() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BOUNDS").is_none_or(|v| v != "0"))
 }
 
+/// Emit one set of loads for the first 48 bytes of bounding coordinates,
+/// shared by the 16-bit and 32-bit box formats (`VICTORY_BVH_SHARED_BOX_LOAD=1`).
+pub fn shared_box_loads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_SHARED_BOX_LOAD").is_some_and(|v| v == "1"))
+}
+
 /// Whether a loop that several blocks branch back to gets one latch they all
 /// go through, in a program that reads lanes (`bitcode`'s `single_latches`).
 /// The dxil-spirv of vkd3d-proton 2576c0b4 never comes back from such a

@@ -335,6 +335,9 @@ impl<'a> Lower<'a> {
     fn bvh_boxes(&mut self, at: NodeAt, kind: V, ray: &Ray, sort: bool) -> [V; 4] {
         let head = self.cur;
         let children = self.bvh_node_words(at, None, 0, 4);
+        // Both box formats read bytes 16..64. Loading these words here
+        // removes three duplicate load instructions from the emitted DXIL.
+        let shared = crate::emit::shared_box_loads().then(|| self.bvh_node_words(at, None, 16, 12));
         let k5 = self.s.m.i32(5);
         let wide = self.s.m.cmp(head, pred::EQ, kind, k5);
         let (wide_block, half_block) = (self.s.m.new_block(), self.s.m.new_block());
@@ -345,17 +348,17 @@ impl<'a> Lower<'a> {
         // 32-bit floats: 24 dwords from byte 16.
         self.cur = wide_block;
         let k16 = self.s.m.i32(16);
-        let mut words = self.bvh_node_words(at, None, 16, 12);
+        let first = shared.clone().unwrap_or_else(|| self.bvh_node_words(at, None, 16, 12));
         let second = self.bvh_second_half(at);
-        words.extend(self.bvh_node_words(second, None, 0, 12));
-        let floats: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
+        let last = self.bvh_node_words(second, None, 0, 12);
+        let floats: Vec<V> = first.into_iter().chain(last).map(|w| self.as_float(w)).collect();
         // (The look for the second half goes on in another block.)
         let wide_block = self.cur;
         self.s.m.terminate(wide_block, Term::Br(join));
         // 16-bit floats: 24 halves in 12 dwords from byte 16, the low half
         // of a dword first.
         self.cur = half_block;
-        let words = self.bvh_node_words(at, None, 16, 12);
+        let words = shared.unwrap_or_else(|| self.bvh_node_words(at, None, 16, 12));
         let f32t = self.s.t.f32;
         let mut halves = Vec::with_capacity(24);
         for n in 0..24 {
