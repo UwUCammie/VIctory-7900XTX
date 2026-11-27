@@ -440,29 +440,52 @@ fn pipeline<'a>(this: This) -> &'a Pipeline {
     unsafe { &*this.cast::<Pipeline>() }
 }
 
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordedUse {
+    Compute,
+    Screen,
+}
+
 /// Records early demand without retaining a title pipeline until the list
 /// is reset. The worker gets its own reference once work is queued.
 #[cfg(windows)]
-pub(crate) struct RecordedCompute(std::sync::Weak<make::Pending>);
+pub(crate) struct RecordedPipeline {
+    pending: std::sync::Weak<make::Pending>,
+    pub(crate) kind: RecordedUse,
+}
 
 #[cfg(windows)]
-impl RecordedCompute {
+impl RecordedPipeline {
+    #[cfg(test)]
+    pub(crate) fn unbound(kind: RecordedUse) -> Self {
+        Self { pending: std::sync::Weak::new(), kind }
+    }
+
     pub(crate) fn requested(self) {
-        if let Some(p) = self.0.upgrade() {
-            make::recorded_compute(&p);
+        if let Some(p) = self.pending.upgrade() {
+            make::recorded(&p, self.kind);
         }
     }
 }
 
 #[cfg(windows)]
-pub(crate) fn recorded_compute(this: This) -> Option<RecordedCompute> {
-    if !make::track_recorded_compute() || this.is_null() {
+pub(crate) fn recorded_pipeline(this: This) -> Option<RecordedPipeline> {
+    let compute = make::track_recorded(RecordedUse::Compute);
+    let screen = make::track_recorded(RecordedUse::Screen);
+    if (!compute && !screen) || this.is_null() {
         return None;
     }
     let p = pipeline(this);
     // The builder is enabled and prepared as a group in replay.
-    (!p.builder && p.host.may_record_compute())
-        .then(|| RecordedCompute(Arc::downgrade(&p.host)))
+    let kind = if compute && !p.builder && p.host.may_record(RecordedUse::Compute) {
+        RecordedUse::Compute
+    } else if screen && p.host.may_record(RecordedUse::Screen) {
+        RecordedUse::Screen
+    } else {
+        return None;
+    };
+    Some(RecordedPipeline { pending: Arc::downgrade(&p.host), kind })
 }
 
 /// List method: logs each pipeline's shaders the first time a list binds

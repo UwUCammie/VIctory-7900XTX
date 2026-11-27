@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use super::Shader;
+use super::{RecordedUse, Shader};
 use super::host::{GraphicsState, HostPipeline};
 
 /// What a host pipeline is made from, and the host pipeline once made.
@@ -104,8 +104,12 @@ impl Pending {
         &self.key
     }
 
-    pub(super) fn may_record_compute(&self) -> bool {
-        self.compute && !self.used.load(Ordering::Relaxed) && !self.lost.load(Ordering::Relaxed)
+    pub(super) fn may_record(&self, kind: RecordedUse) -> bool {
+        let matches = match kind {
+            RecordedUse::Compute => self.compute,
+            RecordedUse::Screen => self.screen && screens_first(),
+        };
+        matches && !self.used.load(Ordering::Relaxed) && !self.lost.load(Ordering::Relaxed)
     }
 
     /// Whether its first use waits by a budget of its own and its making
@@ -474,11 +478,12 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         if let Some(recorded) = p.recorded_at.get() {
+            let pass = if p.compute { "compute" } else { "screen" };
             tracing::info!(
                 us = recorded.elapsed().as_micros() as u64,
                 ready = p.made.get().is_some_and(Option::is_some),
                 shaders = ?p.shaders,
-                "recorded compute pipeline reached replay"
+                "recorded {pass} pipeline reached replay"
             );
         }
         super::library::note_used(&p.key);
@@ -541,36 +546,47 @@ fn within_early_compute_limit(bytes: usize, limit: usize) -> bool {
     bytes != 0 && bytes <= limit
 }
 
-fn recorded_compute_settings() -> (bool, bool) {
-    static SETTINGS: OnceLock<(bool, bool)> = OnceLock::new();
-    *SETTINGS.get_or_init(|| {
-        let enabled = std::env::var_os("VICTORY_EARLY_RECORDED_COMPUTE").is_some_and(|v| v == "1");
-        let trace = std::env::var_os("VICTORY_RECORDED_COMPUTE_TRACE").is_some_and(|v| v == "1");
-        tracing::info!(enabled, trace, "recorded compute pipeline lookahead");
+fn recorded_settings(kind: RecordedUse) -> (bool, bool) {
+    static COMPUTE: OnceLock<(bool, bool)> = OnceLock::new();
+    static SCREEN: OnceLock<(bool, bool)> = OnceLock::new();
+    let (settings, enable, trace, pass) = match kind {
+        RecordedUse::Compute => (&COMPUTE, "VICTORY_EARLY_RECORDED_COMPUTE", "VICTORY_RECORDED_COMPUTE_TRACE", "compute"),
+        RecordedUse::Screen => (&SCREEN, "VICTORY_EARLY_RECORDED_SCREEN", "VICTORY_RECORDED_SCREEN_TRACE", "screen"),
+    };
+    *settings.get_or_init(|| {
+        let enabled = std::env::var_os(enable).is_some_and(|v| v == "1");
+        let trace = std::env::var_os(trace).is_some_and(|v| v == "1");
+        tracing::info!(enabled, trace, "recorded {pass} pipeline lookahead");
         (enabled, trace)
     })
 }
 
-pub(super) fn track_recorded_compute() -> bool {
-    let (enabled, trace) = recorded_compute_settings();
+pub(super) fn track_recorded(kind: RecordedUse) -> bool {
+    let (enabled, trace) = recorded_settings(kind);
     enabled || trace
 }
 
-/// The title recorded a dispatch that uses this pipeline. Give the existing
-/// early queue a chance to make it before replay asks for the pipeline.
-pub(super) fn recorded_compute(p: &Arc<Pending>) {
-    if !p.may_record_compute() {
+/// Start a pipeline before replay. Screen draws join the priority FIFO at
+/// recording time. Compute dispatches use the existing early queue.
+pub(super) fn recorded(p: &Arc<Pending>, kind: RecordedUse) {
+    if !p.may_record(kind) {
         return;
     }
-    let (enabled, trace) = recorded_compute_settings();
+    let (enabled, trace) = recorded_settings(kind);
     if trace {
         p.recorded_at.get_or_init(Instant::now);
     }
-    if enabled && p.queue_state.load(Ordering::Relaxed) == NOT_QUEUED
-        && workers() && enqueue(p, EARLY)
-    {
-        static STARTED: std::sync::Once = std::sync::Once::new();
-        STARTED.call_once(|| tracing::info!("first recorded compute pipeline queued before replay"));
+    let priority = match kind {
+        RecordedUse::Compute => EARLY,
+        RecordedUse::Screen => REQUESTED,
+    };
+    if enabled && p.queue_state.load(Ordering::Relaxed) < priority && workers() && enqueue(p, priority) {
+        static COMPUTE_STARTED: std::sync::Once = std::sync::Once::new();
+        static SCREEN_STARTED: std::sync::Once = std::sync::Once::new();
+        match kind {
+            RecordedUse::Compute => COMPUTE_STARTED.call_once(|| tracing::info!("first recorded compute pipeline queued before replay")),
+            RecordedUse::Screen => SCREEN_STARTED.call_once(|| tracing::info!("first recorded screen pipeline queued before replay")),
+        }
     }
 }
 

@@ -34,6 +34,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use crate::descriptor::RtvRecord;
 use crate::draw::{IndexView, VertexView};
+use crate::pipeline::{RecordedPipeline, RecordedUse};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
 
@@ -64,7 +65,7 @@ pub(crate) fn wanted() -> bool {
 pub(super) struct Front {
     recording: Option<Arc<Recording>>,
     words: Vec<u64>,
-    compute: Option<crate::pipeline::RecordedCompute>,
+    pipeline: Option<RecordedPipeline>,
     closed: bool,
     submitted: bool,
 }
@@ -85,7 +86,7 @@ impl Front {
             recording.abandoned.store(true, Release);
         }
         self.words.clear();
-        self.compute = None;
+        self.pipeline = None;
     }
 
     /// Begins a recording, with `pipeline` bound.
@@ -100,12 +101,12 @@ impl Front {
 
     fn track_pipeline(&mut self, pipeline: This) {
         if !self.closed && self.recording.is_some() {
-            self.compute = crate::pipeline::recorded_compute(pipeline);
+            self.pipeline = crate::pipeline::recorded_pipeline(pipeline);
         }
     }
 
-    fn request_compute(&mut self) {
-        if let Some(pipeline) = self.compute.take() {
+    fn request_pipeline(&mut self, kind: RecordedUse) {
+        if let Some(pipeline) = self.pipeline.take_if(|p| p.kind == kind) {
             pipeline.requested();
         }
     }
@@ -475,12 +476,12 @@ plain! {
     COMPUTE_VIEW compute_view = state::compute_view, (slot: u32, address: u64);
     GRAPHICS_VIEW graphics_view = state::graphics_view, (slot: u32, address: u64);
     SET_PIPELINE record_pipeline = super::set_pipeline, (pipeline: This);
-    DRAW draw = state::draw, (vertices: u32, instances: u32, first: u32, first_instance: u32);
-    DRAW_INDEXED draw_indexed = state::draw_indexed, (indices: u32, instances: u32, first: u32, base: i32, first_instance: u32);
+    DRAW record_draw = state::draw, (vertices: u32, instances: u32, first: u32, first_instance: u32);
+    DRAW_INDEXED record_draw_indexed = state::draw_indexed, (indices: u32, instances: u32, first: u32, base: i32, first_instance: u32);
     DISPATCH record_dispatch = state::dispatch, (x: u32, y: u32, z: u32);
     DISPATCH_X record_dispatch_x = super::dispatch_x, (x: u32, y: u32, z: u32, flags: u32);
-    DISPATCH_MESH dispatch_mesh = state::dispatch_mesh, (x: u32, y: u32, z: u32);
-    DISPATCH_MESH_X dispatch_mesh_x = state::dispatch_mesh_x, (x: u32, flags: u64, indirect: u64, payload: u64);
+    DISPATCH_MESH record_dispatch_mesh = state::dispatch_mesh, (x: u32, y: u32, z: u32);
+    DISPATCH_MESH_X record_dispatch_mesh_x = state::dispatch_mesh_x, (x: u32, flags: u64, indirect: u64, payload: u64);
     COPY_BUFFER copy_buffer_region = super::copy_buffer_region, (dst: This, dst_offset: u64, src: This, src_offset: u64, len: u64);
     COPY_RESOURCE copy_resource = super::copy_resource, (dst: This, src: This);
     COPY_RESOURCE_X copy_resource_x = super::copy_resource_x, (dst: This, src: This, flags: u32);
@@ -500,18 +501,46 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
     record_pipeline(this, pipeline);
 }
 
+extern "system" fn draw(this: This, vertices: u32, instances: u32, first: u32, first_instance: u32) {
+    if vertices != 0 && instances != 0 {
+        front(this).request_pipeline(RecordedUse::Screen);
+    }
+    record_draw(this, vertices, instances, first, first_instance);
+}
+
+extern "system" fn draw_indexed(this: This, indices: u32, instances: u32, first: u32, base: i32, first_instance: u32) {
+    if indices != 0 && instances != 0 {
+        front(this).request_pipeline(RecordedUse::Screen);
+    }
+    record_draw_indexed(this, indices, instances, first, base, first_instance);
+}
+
 extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
     if x != 0 && y != 0 && z != 0 {
-        front(this).request_compute();
+        front(this).request_pipeline(RecordedUse::Compute);
     }
     record_dispatch(this, x, y, z);
 }
 
 extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     if x != 0 && y != 0 && z != 0 {
-        front(this).request_compute();
+        front(this).request_pipeline(RecordedUse::Compute);
     }
     record_dispatch_x(this, x, y, z, flags);
+}
+
+extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
+    if x != 0 && y != 0 && z != 0 {
+        front(this).request_pipeline(RecordedUse::Screen);
+    }
+    record_dispatch_mesh(this, x, y, z);
+}
+
+extern "system" fn dispatch_mesh_x(this: This, x: u32, flags: u64, indirect: u64, payload: u64) {
+    if x != 0 && indirect == 0 {
+        front(this).request_pipeline(RecordedUse::Screen);
+    }
+    record_dispatch_mesh_x(this, x, flags, indirect, payload);
 }
 
 extern "system" fn execute_indirect(
@@ -524,11 +553,11 @@ extern "system" fn execute_indirect(
     count_offset: u64,
 ) {
     let front = front(this);
-    if max != 0 && front.compute.is_some()
+    if max != 0 && front.pipeline.as_ref().is_some_and(|p| p.kind == RecordedUse::Compute)
         && matches!(crate::signature::layout(signature),
             Some((_, [[INDIRECT_DISPATCH | INDIRECT_DISPATCH_SINGLE, ..]])))
     {
-        front.request_compute();
+        front.request_pipeline(RecordedUse::Compute);
     }
     record_execute_indirect(this, signature, max, arguments, offset, count, count_offset);
 }
@@ -999,6 +1028,26 @@ mod tests {
         assert_eq!(&list.thin.words[2..], &[
             Plain::DISPATCH as u64 | 3 << 16, 4, 3, 2,
             Plain::DISPATCH_X as u64 | 4 << 16, 1, 0, 2, 8,
+        ]);
+    }
+
+    #[test]
+    fn a_direct_screen_command_uses_the_hint_without_changing_its_packet() {
+        let mut list = super::super::boxed(0, std::ptr::null(), true);
+        list.thin.begin(0, std::ptr::null());
+        list.thin.pipeline = Some(RecordedPipeline::unbound(RecordedUse::Screen));
+        let this = std::ptr::from_mut(&mut *list).cast_const().cast();
+        draw(this, 3, 0, 5, 7);
+        dispatch(this, 2, 1, 1);
+        dispatch_mesh_x(this, 3, 0, 64, 0);
+        assert!(list.thin.pipeline.is_some());
+        dispatch_mesh(this, 3, 1, 1);
+        assert!(list.thin.pipeline.is_none());
+        assert_eq!(&list.thin.words[2..], &[
+            Plain::DRAW as u64 | 4 << 16, 3, 0, 5, 7,
+            Plain::DISPATCH as u64 | 3 << 16, 2, 1, 1,
+            Plain::DISPATCH_MESH_X as u64 | 4 << 16, 3, 0, 64, 0,
+            Plain::DISPATCH_MESH as u64 | 3 << 16, 3, 1, 1,
         ]);
     }
 
