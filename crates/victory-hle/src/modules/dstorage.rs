@@ -2004,7 +2004,7 @@ mod tests {
     #[test]
     fn a_full_queue_holds_page_destinations_for_the_titles_submit() {
         use crate::modules::xmem;
-        const REQUESTS: u32 = 140;
+        const REQUESTS: u64 = 140;
         const BYTES: usize = REQUESTS as usize * 64;
         // Two pages the title owns: the one its list still names from
         // earlier, and the one it maps for this batch when it submits.
