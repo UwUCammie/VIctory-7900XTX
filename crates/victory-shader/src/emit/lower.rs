@@ -6,7 +6,7 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::UserData;
@@ -260,6 +260,74 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+const COMPUTED_MOVE_LIMIT: usize = 6;
+
+#[derive(Default)]
+struct NumericUses<'a> {
+    transfers: Vec<&'a Inst>,
+    arithmetic: bool,
+    through_transfers: [Cell<Option<bool>>; COMPUTED_MOVE_LIMIT + 1],
+}
+
+impl<'a> NumericUses<'a> {
+    fn collect(program: &'a Program) -> HashMap<Value, Self> {
+        let mut uses: HashMap<Value, Self> = HashMap::new();
+        for block in &program.blocks {
+            for phi in &block.phis {
+                for &arg in &phi.args {
+                    uses.entry(arg).or_default();
+                }
+            }
+            for inst in &block.insts {
+                if !matches!(inst.fields, Fields::Sop { .. } | Fields::Valu(_)) {
+                    continue;
+                }
+                let name = inst.name();
+                let moves = matches!(
+                    name,
+                    "s_mov_b32"
+                        | "s_mov_b64"
+                        | "v_mov_b32"
+                        | "v_readfirstlane_b32"
+                        | "v_readlane_b32"
+                        | "v_writelane_b32"
+                        | "v_cndmask_b32"
+                );
+                let arithmetic = !moves && !(name.starts_with("v_cmp") || name.starts_with("s_cmp"));
+                for &(_, value) in &inst.reads {
+                    let readers = uses.entry(value).or_default();
+                    readers.arithmetic |= arithmetic;
+                    if moves && readers.transfers.last().is_none_or(|last| !std::ptr::eq(*last, inst)) {
+                        readers.transfers.push(inst);
+                    }
+                }
+            }
+        }
+        uses
+    }
+
+    /// Follow transfer outputs at most `depth` times. A compare alone is
+    /// insufficient because waterfall loops compare descriptor dwords across lanes.
+    fn computed(uses: &HashMap<Value, Self>, value: Value, depth: usize) -> bool {
+        let Some(readers) = uses.get(&value) else { return false };
+        if readers.arithmetic {
+            return true;
+        }
+        if depth == 0 || readers.transfers.is_empty() {
+            return false;
+        }
+        let cached = &readers.through_transfers[depth];
+        if let Some(answer) = cached.get() {
+            return answer;
+        }
+        let answer = readers.transfers.iter().any(|inst| {
+            inst.writes.iter().any(|&(_, out)| Self::computed(uses, out, depth - 1))
+        });
+        cached.set(Some(answer));
+        answer
+    }
+}
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -276,7 +344,7 @@ struct Lower<'a> {
     phi_at: HashMap<Value, (usize, usize)>,
     /// Scalar and vector instructions that read each value, built on the
     /// first descriptor query. Phi inputs also have entries, possibly empty.
-    numeric_uses: OnceCell<HashMap<Value, Vec<&'a Inst>>>,
+    numeric_uses: OnceCell<HashMap<Value, NumericUses<'a>>>,
     /// Descriptor dwords with no host value (addresses, formats, all of a constant
     /// buffer's): no program reads them as numbers ([`Self::dead`]).
     stale: HashSet<Value>,
@@ -3317,60 +3385,14 @@ impl<'a> Lower<'a> {
         self.s.m.extract(entry, r, index % 4)
     }
 
-    fn numeric_uses(&self) -> &HashMap<Value, Vec<&'a Inst>> {
-        self.numeric_uses.get_or_init(|| {
-            let mut uses: HashMap<Value, Vec<&Inst>> = HashMap::new();
-            for block in &self.x.p.blocks {
-                for phi in &block.phis {
-                    for &arg in &phi.args {
-                        uses.entry(arg).or_default();
-                    }
-                }
-                for inst in &block.insts {
-                    if matches!(inst.fields, Fields::Sop { .. } | Fields::Valu(_)) {
-                        for &(_, value) in &inst.reads {
-                            let readers = uses.entry(value).or_default();
-                            if readers.last().is_none_or(|last| !std::ptr::eq(*last, inst)) {
-                                readers.push(inst);
-                            }
-                        }
-                    }
-                }
-            }
-            uses
-        })
+    fn numeric_uses(&self) -> &HashMap<Value, NumericUses<'a>> {
+        self.numeric_uses.get_or_init(|| NumericUses::collect(self.x.p))
     }
 
     /// Whether some instruction reads `v` as a number (or may, through a
     /// join), rather than in a descriptor operand.
     fn read_as_number(&self, v: Value) -> bool {
         self.numeric_uses().contains_key(&v)
-    }
-
-    /// Whether some instruction computes with `v` (scalar or vector
-    /// arithmetic), rather than only naming it in a descriptor operand,
-    /// moving it (at most `depth` moves are followed) or comparing it: a
-    /// waterfall loop keeps a descriptor's dwords per lane, reads the first
-    /// lane's back and compares the lanes' with them.
-    fn computed_with(&self, v: Value, depth: u32) -> bool {
-        self.numeric_uses().get(&v).into_iter().flatten().any(|i| {
-            let name = i.name();
-            let moves = matches!(
-                name,
-                "s_mov_b32"
-                    | "s_mov_b64"
-                    | "v_mov_b32"
-                    | "v_readfirstlane_b32"
-                    | "v_readlane_b32"
-                    | "v_writelane_b32"
-                    | "v_cndmask_b32"
-            );
-            if moves {
-                depth > 0 && i.writes.iter().any(|w| self.computed_with(w.1, depth - 1))
-            } else {
-                !(name.starts_with("v_cmp") || name.starts_with("s_cmp"))
-            }
-        })
     }
 
     /// Whether the image `src` names is one of 32-bit integers (one channel):
@@ -7255,7 +7277,7 @@ impl<'a> Lower<'a> {
                 // host can tell it.
                 let computed = (0..2u8).any(|k| {
                     inst.write(Reg::S(code + first + k))
-                        .is_some_and(|v| self.computed_with(v, 6))
+                        .is_some_and(|v| NumericUses::computed(self.numeric_uses(), v, COMPUTED_MOVE_LIMIT))
                 });
                 // (A descriptor nothing uses as one gets it whenever the host can tell it, as
                 // a buffer whose address alone is read does.)
@@ -13606,6 +13628,29 @@ mod tests {
     }
 
     /// Whether a synthetic compute program translates with these input registers.
+    #[test]
+    fn computed_descriptor_use_caches_the_remaining_move_depth() {
+        let words: [u32; 5] = [
+            0xBE94_0306, // s_mov_b32 s20, s6
+            0xBE86_0314, // s_mov_b32 s6, s20
+            0x8000_8106, // s_add_u32 s0, s6, 1
+            0xBF06_0201, // s_cmp_eq_u32 s1, s2
+            0xBF81_0000, // s_endpgm
+        ];
+        let bytes: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let program = crate::ir::build(&bytes, false, 256).unwrap();
+        let instructions = &program.blocks[0].insts;
+        let copied = instructions[0].read(Reg::S(6)).unwrap();
+        let compared = instructions[3].read(Reg::S(1)).unwrap();
+        let uses = NumericUses::collect(&program);
+
+        assert!(!NumericUses::computed(&uses, copied, 1));
+        assert!(NumericUses::computed(&uses, copied, 2));
+        assert!(!NumericUses::computed(&uses, copied, 1));
+        assert!(uses.contains_key(&compared));
+        assert!(!NumericUses::computed(&uses, compared, COMPUTED_MOVE_LIMIT));
+    }
+
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
