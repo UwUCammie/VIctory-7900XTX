@@ -13630,6 +13630,9 @@ mod tests {
     /// Whether a synthetic compute program translates with these input registers.
     #[test]
     fn computed_descriptor_use_caches_the_remaining_move_depth() {
+        use super::{COMPUTED_MOVE_LIMIT, NumericUses};
+        use crate::ir::Reg;
+
         let words: [u32; 5] = [
             0xBE94_0306, // s_mov_b32 s20, s6
             0xBE86_0314, // s_mov_b32 s6, s20
