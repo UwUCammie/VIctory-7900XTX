@@ -520,6 +520,44 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// A recorder can take its frame number, then reach the budget lock out of order.
+fn reserve_wait(
+    spent: &mut (u64, Duration),
+    frame: u64,
+    budget: Duration,
+    shared: bool,
+) -> Duration {
+    if frame < spent.0 {
+        return Duration::ZERO;
+    }
+    if frame > spent.0 {
+        *spent = (frame, Duration::ZERO);
+    }
+    let left = budget.saturating_sub(spent.1);
+    if shared {
+        spent.1 += left;
+    }
+    left
+}
+
+/// The first recorder in a frame sets its deadline. A late recorder for
+/// an older frame shares the current deadline.
+fn compute_deadline(
+    current: &mut Option<(u64, Instant)>,
+    frame: u64,
+    now: Instant,
+    budget: Duration,
+) -> Instant {
+    if let Some((newest, deadline)) = *current
+        && frame <= newest
+    {
+        return deadline;
+    }
+    let deadline = now + budget;
+    *current = Some((frame, deadline));
+    deadline
+}
+
 /// Waits for a compute pass's pipeline until it is made or `budget` after
 /// the frame's first such wait, whichever thread that was: all of a frame's
 /// waits end together, and none takes another's time (a thread that came
@@ -527,13 +565,10 @@ fn shared_budget() -> bool {
 /// [`wait`] counts it, and dropped its pass at once).
 fn wait_compute(p: &Arc<Pending>, frame: u64, budget: Duration) {
     // The frame the waiting belongs to and when it ends.
-    static UNTIL: Mutex<(u64, Option<Instant>)> = Mutex::new((u64::MAX, None));
+    static UNTIL: Mutex<Option<(u64, Instant)>> = Mutex::new(None);
     let until = {
         let mut until = UNTIL.lock().unwrap_or_else(|e| e.into_inner());
-        if until.0 != frame {
-            *until = (frame, None);
-        }
-        *until.1.get_or_insert_with(|| Instant::now() + budget)
+        compute_deadline(&mut until, frame, Instant::now(), budget)
     };
     let waiting = crate::timeline::span("pipeline: first use waits for a host pipeline");
     let started = Instant::now();
@@ -575,19 +610,12 @@ fn wait(p: &Arc<Pending>, frame: u64) {
     }
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now); of the passes over the screen too.
-    static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
+    static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((0, Duration::ZERO)) }; 2];
     let spent_of = &SPENT[usize::from(screen)];
     let shared = shared_budget();
     let left = {
         let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
-        if spent.0 != frame {
-            *spent = (frame, Duration::ZERO);
-        }
-        let left = budget.saturating_sub(spent.1);
-        if shared {
-            spent.1 += left;
-        }
-        left
+        reserve_wait(&mut spent, frame, budget, shared)
     };
     if left.is_zero() {
         return;
@@ -1043,6 +1071,37 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn late_pipeline_wait_keeps_newer_frame_budget() {
+        let budget = Duration::from_millis(500);
+        for shared in [false, true] {
+            let mut spent = (0, Duration::ZERO);
+            assert_eq!(reserve_wait(&mut spent, 0, budget, shared), budget);
+            assert_eq!(reserve_wait(&mut spent, 8, budget, shared), budget);
+            if !shared {
+                spent.1 = Duration::from_millis(250);
+            }
+            let before = spent;
+            assert_eq!(reserve_wait(&mut spent, 7, budget, shared), Duration::ZERO);
+            assert_eq!(spent, before);
+            assert_eq!(reserve_wait(&mut spent, 8, budget, shared), budget - before.1);
+            assert_eq!(reserve_wait(&mut spent, 9, budget, shared), budget);
+        }
+    }
+
+    #[test]
+    fn late_compute_wait_keeps_newer_frame_deadline() {
+        let started = Instant::now();
+        let budget = Duration::from_millis(500);
+        let until = started + budget;
+        let later = started + Duration::from_millis(250);
+        let mut current = None;
+        assert_eq!(compute_deadline(&mut current, 8, started, budget), until);
+        assert_eq!(compute_deadline(&mut current, 7, later, budget), until);
+        assert_eq!(compute_deadline(&mut current, 8, later, budget), until);
+        assert_eq!(compute_deadline(&mut current, 9, later, budget), later + budget);
+    }
 
     #[test]
     fn all_workers_have_a_valid_wait_at_the_maximum_setting() {
