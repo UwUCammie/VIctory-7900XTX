@@ -363,16 +363,19 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         let mut level = 0;
         // Behind what writes what this reads or writes, and, if this
         // writes, behind what reads it.
-        let ahead: Box<dyn Iterator<Item = usize>> =
-            if writes { Box::new(0..out.len()) } else { Box::new(copies.iter().copied()) };
-        for k in ahead {
+        let mut dependency = |k: usize| {
             let (j, at): (usize, u32) = out[k];
-            let Some((jr, jw)) = reads_writes(&does[j]) else {
-                continue;
-            };
-            if at >= level && (meet(jw, r) || meet(jw, w) || meet(jr, w)) {
+            if let Some((jr, jw)) = reads_writes(&does[j])
+                && at >= level
+                && (meet(jw, r) || meet(jw, w) || meet(jr, w))
+            {
                 level = at + 1;
             }
+        };
+        if writes {
+            (0..out.len()).for_each(&mut dependency);
+        } else {
+            copies.iter().copied().for_each(&mut dependency);
         }
         if writes {
             copies.push(out.len());
