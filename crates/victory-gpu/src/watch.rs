@@ -64,10 +64,11 @@ impl Journal {
             return before;
         }
         let all = self.parts.entry(page).or_insert([before; PARTS]);
-        for (k, at) in all.iter_mut().enumerate() {
-            if parts >> k & 1 != 0 {
-                *at = now;
-            }
+        let mut remaining = parts;
+        while remaining != 0 {
+            let part = remaining.trailing_zeros() as usize;
+            all[part] = now;
+            remaining &= remaining - 1;
         }
         before
     }
