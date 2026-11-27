@@ -185,9 +185,18 @@ fn screens_first() -> bool {
 
 /// What the first use of a compute pass may wait for its pipeline, apart
 /// from the frame's budget and whatever else waits in the frame
-/// (`VICTORY_COMPUTE_WAIT_MS`, read here). Unset: 10 s under Wine, and on
-/// Windows nothing of its own (the frame's half second, as before); `0`:
-/// as before under Wine too. Below the title's 30 s watchdog.
+/// (`VICTORY_COMPUTE_WAIT_MS`, read here). Unset: half a second under Wine,
+/// and on Windows nothing of its own (the frame's half second, as before);
+/// `0`: as before under Wine too.
+///
+/// Half a second and not more: with every cache empty (the layer's,
+/// vkd3d-proton's, Mesa's) 10 s gave 95 waits of a second or more, the
+/// longest the whole 10 s, and 25 s of frames of 5 s at the world's start,
+/// where half a second gave none over 501 ms (runs 101 and 102; UwUCammie
+/// measured the same on pull request 440). With vkd3d-proton's cache there,
+/// no wait passed a tenth of a second in 17 runs: what counted is that the
+/// waits are apart from the frame's shared budget and the pipelines made
+/// first.
 ///
 /// A compute pass can be one the title runs once and whose result it keeps
 /// (the module's notes): dropped, it is not run again. Under Wine the
@@ -199,7 +208,7 @@ fn compute_budget() -> Duration {
     static BUDGET: OnceLock<Duration> = OnceLock::new();
     *BUDGET.get_or_init(|| {
         let asked = std::env::var("VICTORY_COMPUTE_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok());
-        let millis = asked.unwrap_or(if on_wine() { 10_000 } else { 0 });
+        let millis = asked.unwrap_or(if on_wine() { 500 } else { 0 });
         if millis != 0 {
             tracing::info!(millis, "compute passes wait for their host pipeline by a budget of their own (VICTORY_COMPUTE_WAIT_MS)");
         }
