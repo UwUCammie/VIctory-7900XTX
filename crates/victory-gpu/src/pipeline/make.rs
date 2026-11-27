@@ -426,6 +426,7 @@ struct Queue {
     /// ([`Queue::reserved`]).
     taken: Vec<Arc<Pending>>,
     workers: Option<usize>,
+    strict_compute_reserve: bool,
 }
 
 impl Queue {
@@ -440,6 +441,7 @@ impl Queue {
             requested: VecDeque::new(),
             taken: Vec::new(),
             workers: None,
+            strict_compute_reserve: false,
         }
     }
 
@@ -518,10 +520,14 @@ impl Queue {
         let waiting = |list: &mut VecDeque<Arc<Pending>>| {
             std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == REQUESTED)
         };
-        let mut p = self.screen.pop_front();
+        let reserved = !screens_only && self.reserved();
+        let mut p = if reserved && self.strict_compute_reserve { None } else { self.screen.pop_front() };
+        if reserved && p.is_some() && !SCREEN_USED_RESERVE.swap(true, Ordering::Relaxed) {
+            tracing::info!("a screen pass took the last general pipeline worker");
+        }
         if !screens_only {
             p = p.or_else(|| waiting(&mut self.hurried));
-            if p.is_none() && !self.reserved() {
+            if p.is_none() && !reserved {
                 p = waiting(&mut self.compute)
                     .or_else(|| self.requested.pop_front())
                     .or_else(|| unclaimed(&mut self.early));
@@ -547,6 +553,7 @@ impl Queue {
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
 static AVAILABLE: Condvar = Condvar::new();
+static SCREEN_USED_RESERVE: AtomicBool = AtomicBool::new(false);
 
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
@@ -605,7 +612,9 @@ fn workers() -> bool {
                 .and_then(|v| v.trim().parse().ok()),
             std::thread::available_parallelism().map_or(2, |n| n.get()),
         );
-        tracing::info!(workers, "pipeline workers");
+        let strict = std::env::var_os("VICTORY_COMPUTE_STRICT_RESERVE").is_some_and(|v| v == "1");
+        QUEUE.lock().unwrap_or_else(|e| e.into_inner()).strict_compute_reserve = strict;
+        tracing::info!(workers, strict_compute_reserve = strict, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         for i in 0..workers + screens {
             let screens_only = i >= workers;
@@ -848,6 +857,36 @@ mod tests {
         let _ = c.made.set(None);
         let _ = waited.made.set(None);
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &d));
+    }
+
+    #[test]
+    fn strict_reserve_leaves_the_screen_job_to_a_dedicated_worker() {
+        if !compute_waits() {
+            return;
+        }
+        let mut queue = Queue::new();
+        queue.workers = Some(4);
+        queue.strict_compute_reserve = true;
+        queue.taken.extend((0..3).map(|_| Arc::new(Pending::new(Vec::new(), None))));
+        let screen = Arc::new(Pending::new(Vec::new(), None));
+        screen.queue_state.store(REQUESTED, Ordering::Relaxed);
+        queue.screen.push_back(screen.clone());
+        assert!(queue.pop(false, 1).is_none());
+
+        let mut waited = Pending::new(Vec::new(), None);
+        waited.compute = true;
+        let waited = Arc::new(waited);
+        queue.push(&waited, REQUESTED);
+        queue.hurry(&waited);
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &waited));
+        assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
+
+        let screen = Arc::new(Pending::new(Vec::new(), None));
+        screen.queue_state.store(REQUESTED, Ordering::Relaxed);
+        queue.screen.push_back(screen.clone());
+        queue.strict_compute_reserve = false;
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &screen));
+        eprintln!("checked both screen policies with the general worker reserved");
     }
 
     /// A frame's compute waits end together, the budget after its first
