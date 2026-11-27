@@ -908,6 +908,10 @@ impl Shader {
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
+        if kind == 5 && super::shader_opt() & super::bitcode::opt::BLOCKS != 0 {
+            self.m.compact_linear_blocks();
+        }
+
         // One back edge a loop where lanes are read: vkd3d-proton's
         // dxil-spirv does not come back from the others (`single_latches`;
         // `VICTORY_SINGLE_LATCH`, on under Wine).

@@ -511,6 +511,44 @@ impl Module {
         self.funcs.iter().any(|f| reads.iter().any(|r| f.name.starts_with(r)))
     }
 
+    /// Join forward branches whose destination has one predecessor and no
+    /// phi nodes. Instruction order stays the same. At the next join, move
+    /// the incoming edge to the block that now holds its terminator.
+    pub fn compact_linear_blocks(&mut self) {
+        let mut predecessors = vec![0; self.blocks.len()];
+        for block in &self.blocks {
+            for &to in successors(block.term).iter() {
+                predecessors[to] += 1;
+            }
+        }
+        for from in 0..self.blocks.len() {
+            while let Some(Term::Br(to)) = self.blocks[from].term
+                && to > from
+                && predecessors[to] == 1
+                && self.blocks[to].phis.is_empty()
+                && let Some(term) = self.blocks[to].term
+                && !successors(Some(term)).contains(&from)
+            {
+                let body = std::mem::take(&mut self.blocks[to].body);
+                self.blocks[to].term = None;
+                self.blocks[from].body.extend(body);
+                self.blocks[from].term = Some(term);
+                for &successor in successors(Some(term)).iter() {
+                    for &phi in &self.blocks[successor].phis {
+                        let Op::Phi(incoming) = &mut self.insts[phi as usize].op else {
+                            unreachable!("a block's phis are phis");
+                        };
+                        for (_, edge) in incoming {
+                            if *edge == to {
+                                *edge = from;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Gives every loop one back edge: a header that several blocks branch
     /// back to gets a latch of its own. Those blocks branch to it, it joins
     /// what each of them brought for the header's phis, and it alone

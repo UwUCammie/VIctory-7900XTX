@@ -60,14 +60,14 @@ pub const FIRST: u32 = 32;
 /// the yard's frame replayed turn by turn, dispatches and draws 18.47 -> 18.45
 /// ms (12 loops) and 18.23 -> 18.16 (5 loops): the driver joins the loads.
 pub const WIDE: u32 = 64;
+/// Forward linear block compaction before writing compute shaders.
+pub const BLOCKS: u32 = 128;
 /// The passes over the module.
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
 /// Every pass.
-pub const ALL: u32 = MODULE | FIRST | WIDE;
-/// The passes that run when nothing says which: every one but [`WIDE`],
-/// which no card has shown a gain for yet (`VICTORY_SHADER_OPT=127` asks
-/// for it).
-pub const DEFAULT: u32 = ALL & !WIDE;
+pub const ALL: u32 = MODULE | FIRST | WIDE | BLOCKS;
+/// The passes that run when nothing says which.
+pub const DEFAULT: u32 = MODULE | FIRST;
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").
@@ -1581,6 +1581,41 @@ mod tests {
         m.optimise(FOLD | FACTS);
         assert_eq!(stores(&m, inner), [[x, x]]);
         assert_eq!(body(&m, out), 2);
+        m.write();
+    }
+
+    #[test]
+    fn linear_blocks_preserve_instruction_order_and_a_successor_phi() {
+        let Diamond {
+            k: Kit { mut m, b, writes, .. },
+            x,
+            y,
+            c,
+            then,
+            other,
+            join,
+        } = diamond();
+        let tail = m.new_block();
+        m.terminate(b, Term::CondBr(c, then, other));
+        m.call(then, writes, vec![x, x]);
+        m.terminate(then, Term::Br(tail));
+        m.call(tail, writes, vec![y, y]);
+        m.terminate(tail, Term::Br(join));
+        m.terminate(other, Term::Br(join));
+        let int = m.int(32);
+        let phi = m.phi(join, int);
+        m.set_phi(phi, vec![(x, tail), (y, other)]);
+        m.call(join, writes, vec![phi, phi]);
+        m.terminate(join, Term::Ret);
+
+        m.compact_linear_blocks();
+        assert_eq!(stores(&m, then), [[x, x], [y, y]]);
+        assert!(m.blocks[tail].term.is_none());
+        assert!(matches!(m.blocks[then].term, Some(Term::Br(to)) if to == join));
+        let Op::Phi(incoming) = &m.insts[m.blocks[join].phis[0] as usize].op else {
+            panic!("the shared join still needs its phi");
+        };
+        assert_eq!(incoming, &[(x, then), (y, other)]);
         m.write();
     }
 
