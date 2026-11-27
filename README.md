@@ -40,6 +40,7 @@ It started at 280 ms a frame in the same scenes three days earlier.
 |---|---|
 | `VICTORY_PORT_CONSTANTS=1` | The title's 174 MB constants heap is read by the card where the title writes it: no uploads, no fills |
 | `VICTORY_PORT_DESCRIPTORS=1` | The title's descriptor-table stores are patched (byte-checked) to report the slots they write, instead of a scan of ~600,000 slots a frame |
+| `VICTORY_PORT_PLACED=1` | With `VICTORY_PORT_CONSTANTS=1`, map a Vulkan-backed graphics heap at the title's reservation. The Linux test also needs `ENABLE_VICTORY_PLACED=1` and the [placed memory layer](tools/vk-layer-placed/README.md). |
 
 What is known to be wrong:
 
