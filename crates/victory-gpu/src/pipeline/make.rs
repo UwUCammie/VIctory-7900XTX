@@ -634,6 +634,7 @@ fn wait(p: &Arc<Pending>, frame: u64) {
             ms = waited.as_millis() as u64,
             made = p.made.get().is_some(),
             shaders = ?p.shaders,
+            key = trace_request_latency().then_some(p.key.as_str()),
             "a pass over the screen was waited for (VICTORY_SCREEN_WAIT_MS=0: dropped past half a second a frame)"
         );
     }
@@ -834,7 +835,7 @@ fn next(screens_only: bool) -> Arc<Pending> {
             drop(queue);
             if let Some(delay) = queued_for {
                 tracing::info!(us = delay.as_micros() as u64, shaders = ?p.shaders,
-                    "a requested pipeline reached a worker");
+                    key = p.key.as_str(), "a requested pipeline reached a worker");
             }
             return p;
         }
