@@ -782,12 +782,31 @@ impl Queue {
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
 static AVAILABLE: Condvar = Condvar::new();
 
-fn waiter_priority() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let enabled = std::env::var_os("VICTORY_PIPELINE_WAITERS_FIRST").is_some_and(|v| v == "1");
-        tracing::info!(enabled, "pipeline priority for active waiters");
-        enabled
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WaiterPriority {
+    Off,
+    All,
+    Screen,
+}
+
+impl WaiterPriority {
+    fn allows(self, pipeline: &Pending) -> bool {
+        self == Self::All || self == Self::Screen && pipeline.screen
+    }
+}
+
+fn waiter_priority() -> WaiterPriority {
+    static MODE: OnceLock<WaiterPriority> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let value = std::env::var_os("VICTORY_PIPELINE_WAITERS_FIRST");
+        let mode = match value.as_deref().and_then(std::ffi::OsStr::to_str) {
+            Some("1") => WaiterPriority::All,
+            Some("screen") => WaiterPriority::Screen,
+            _ => WaiterPriority::Off,
+        };
+        tracing::info!(enabled = mode == WaiterPriority::All, screen_only = mode == WaiterPriority::Screen,
+            "pipeline priority for active waiters");
+        mode
     })
 }
 
@@ -798,7 +817,7 @@ fn trace_request_latency() -> bool {
 
 /// Move a compute or screen request ahead while the caller can still wait.
 fn prefer_waiter(p: &Arc<Pending>, started: Instant, until: Instant) {
-    if !waiter_priority() || started >= until || p.queue_state.load(Ordering::Relaxed) != REQUESTED
+    if !waiter_priority().allows(p) || started >= until || p.queue_state.load(Ordering::Relaxed) != REQUESTED
         || p.waiter_hint.load(Ordering::Relaxed)
     {
         return;
@@ -1218,6 +1237,36 @@ mod tests {
         assert!(!queue.prefer_waiter(&waiting, until));
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &waiting));
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &older));
+        assert!(queue.pop(false, 1).is_none());
+    }
+
+    #[test]
+    fn screen_priority_serves_a_waiting_screen_before_older_compute_requests() {
+        let compute = || {
+            let mut p = Pending::new(Vec::new(), None);
+            p.compute = true;
+            Arc::new(p)
+        };
+        let mut screen = Pending::new(Vec::new(), None);
+        screen.screen = true;
+        let screen = Arc::new(screen);
+        let (first, second) = (compute(), compute());
+        let policy = WaiterPriority::Screen;
+        let mut queue = Queue::new();
+        let until = Instant::now() + Duration::from_secs(5);
+
+        for pipeline in [&first, &second] {
+            // Compute requests that already entered the shared priority queue.
+            pipeline.queue_state.store(REQUESTED, Ordering::Relaxed);
+            queue.screen.push_back(pipeline.clone());
+            assert!(!policy.allows(pipeline));
+        }
+        assert_eq!(queue.push(&screen, REQUESTED), Some(true));
+        assert!(policy.allows(&screen));
+        assert!(queue.prefer_waiter(&screen, until));
+        assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &first));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &second));
         assert!(queue.pop(false, 1).is_none());
     }
 
