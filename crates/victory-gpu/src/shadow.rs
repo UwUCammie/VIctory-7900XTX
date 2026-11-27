@@ -1007,10 +1007,12 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    const MERGE_CHUNK: usize = 64;
+    let len = now.len().min(held.len()).min(title.len());
     let mut differs = 0u64;
-    let (n_chunks, n_tail) = now.as_chunks::<DIFF_CHUNK>();
-    let (h_chunks, h_tail) = held.as_chunks_mut::<DIFF_CHUNK>();
-    let (t_chunks, t_tail) = title.as_chunks_mut::<DIFF_CHUNK>();
+    let (n_chunks, n_tail) = now[..len].as_chunks::<MERGE_CHUNK>();
+    let (h_chunks, h_tail) = held[..len].as_chunks_mut::<MERGE_CHUNK>();
+    let (t_chunks, t_tail) = title[..len].as_chunks_mut::<MERGE_CHUNK>();
     for ((nc, hc), tc) in n_chunks.iter().zip(h_chunks.iter_mut()).zip(t_chunks.iter_mut()) {
         if nc == hc {
             continue;
@@ -1425,6 +1427,21 @@ mod difference_tests {
             assert_eq!(got, differs_ref != 0, "{len}");
             assert_eq!(held_fast, held_ref, "{len}");
             assert_eq!(title_fast, title_ref, "{len}");
+        }
+    }
+
+    #[test]
+    fn merge_piece_visits_only_the_shared_prefix() {
+        for (n, h, t) in [(64, 63, 64), (63, 64, 64), (64, 64, 63), (129, 97, 131)] {
+            let len = n.min(h).min(t);
+            let now = vec![93; n];
+            let mut held = vec![11; h];
+            let mut title = vec![20; t];
+            assert!(super::merge_piece(&now, &mut held, &mut title));
+            assert_eq!(held[..len], now[..len]);
+            assert_eq!(title[..len], now[..len]);
+            assert!(held[len..].iter().all(|&byte| byte == 11));
+            assert!(title[len..].iter().all(|&byte| byte == 20));
         }
     }
 
