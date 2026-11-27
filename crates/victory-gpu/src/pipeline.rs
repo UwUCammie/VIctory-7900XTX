@@ -766,6 +766,10 @@ static FUNCTIONS: Table<24> = {
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
+mod dispatch_trace;
+#[cfg(windows)]
+pub(crate) use dispatch_trace::DispatchTrace;
+#[cfg(windows)]
 pub mod known;
 #[cfg(windows)]
 mod library;

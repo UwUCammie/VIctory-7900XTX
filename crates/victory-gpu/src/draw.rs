@@ -22,6 +22,7 @@ use windows::core::Interface;
 
 use crate::host::HostList;
 use crate::object::This;
+use crate::pipeline::DispatchTrace;
 use crate::pipeline::host::HostPipeline;
 
 /// Shader interface metadata shared by every pipeline variant and draw.
@@ -2886,6 +2887,7 @@ impl State {
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
+        let mut trace = DispatchTrace::start(self.pipeline as This, "direct");
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2902,6 +2904,7 @@ impl State {
             }
             return;
         }
+        trace.outcome("pipeline_unavailable");
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
@@ -2916,10 +2919,12 @@ impl State {
             return;
         };
         if !p.compute {
+            trace.outcome("pipeline_mismatch");
             once!("a dispatch with a graphics pipeline");
             return;
         }
         if !self.bind(list, p, true) {
+            trace.outcome("bind_rejected");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -2956,6 +2961,7 @@ impl State {
         let stamp = crate::host::rtstamps::before(&list.list);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        trace.recorded();
         #[cfg(feature = "diagnostics")]
         if stamp.is_some() {
             crate::host::rtstamps::after(&list.list, stamp, self.stamp_kind(p), p.pso.as_raw() as usize, &p.name);
@@ -4116,6 +4122,15 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        const DRAW: u32 = 0;
+        const INDEXED: u32 = 1;
+        const DISPATCH: u32 = 2;
+        const MESH: u32 = 10;
+        let mut trace = if kind == DISPATCH {
+            DispatchTrace::start(self.pipeline as This, "indirect")
+        } else {
+            DispatchTrace::default()
+        };
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -4125,14 +4140,11 @@ impl State {
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             return false;
         }
-        const DRAW: u32 = 0;
-        const INDEXED: u32 = 1;
-        const DISPATCH: u32 = 2;
-        const MESH: u32 = 10;
         #[cfg(feature = "diagnostics")]
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
+        trace.outcome("pipeline_unavailable");
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
@@ -4162,12 +4174,14 @@ impl State {
             _ => false,
         };
         if !matches_kind {
+            trace.outcome("pipeline_mismatch");
             why(&format!(
                 "pipeline mismatch (compute {}, mesh {}, topology {})",
                 p.compute, p.mesh, self.topology
             ));
             return false;
         }
+        trace.outcome("indirect_arguments_rejected");
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find_any(arguments, len) else {
             why("arguments outside title buffers");
@@ -4312,6 +4326,7 @@ impl State {
             _ => false,
         };
         if !ran {
+            trace.outcome("bind_rejected");
             why("prepare failed");
             return false;
         }
@@ -4338,6 +4353,7 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        trace.recorded();
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
