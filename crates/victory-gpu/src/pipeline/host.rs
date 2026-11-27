@@ -15,6 +15,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::PCSTR;
 
 use super::{Shader, Translated};
+use super::timing::{self, Timing};
 use crate::host::host;
 
 /// A stream's graphics state, owned (the title's stream lives only for the
@@ -455,6 +456,7 @@ impl HostPipeline {
                 s.translated()?;
             }
         }
+        let _timing = Timing::start(shaders);
         let host = host()?;
 
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
@@ -594,6 +596,7 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
+        timing::phase("root_signature");
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
@@ -601,6 +604,7 @@ impl HostPipeline {
                 return None;
             }
         };
+        timing::phase("description");
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
@@ -777,6 +781,7 @@ impl HostPipeline {
         };
         let mut made = make(&desc, &name(rect_gs.as_ref()));
         if made.is_err() && rect_gs.is_some() {
+            timing::phase("description");
             // The host refused the geometry stage: once more without it.
             tracing::warn!(?shaders, "host pipeline refused with the rectangle geometry stage");
             host.log_messages();
