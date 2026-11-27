@@ -1007,7 +1007,7 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
     {
         let len = now.len().min(held.len()).min(title.len());
         if len >= 64 && std::arch::is_x86_feature_detected!("avx2") {
@@ -1034,7 +1034,7 @@ fn merge_piece_scalar(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     differs != 0
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
 #[target_feature(enable = "avx2")]
 unsafe fn merge_piece_avx2(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     use std::arch::x86_64::*;
