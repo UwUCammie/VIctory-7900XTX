@@ -5366,15 +5366,6 @@ impl Host {
             return;
         }
         late_threads();
-        // Fills behind a copy at its place take its bytes
-        // (`place::forwarding`, Grimkaaah f2586ef), before anything looks at
-        // what steps read: the cut below, the submission's waits and what is
-        // done on the card.
-        if place::forwarding() {
-            let written = line().written.clone();
-            let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
-            place::forward_fills(&runs, &written);
-        }
         if let Some(cut) = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
             card_steps::cut_for(&runs)
@@ -5396,6 +5387,12 @@ impl Host {
     fn send_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
+            // Forward within the final submission, whose flight keeps both
+            // lists alive. A cut can recycle the producer independently.
+            if place::forwarding() {
+                let written = line().written.clone();
+                place::forward_fills(&runs, &written);
+            }
             self.submit(&runs, parts, true)
         };
         let Some((mut submitted, sent)) = sent else {
