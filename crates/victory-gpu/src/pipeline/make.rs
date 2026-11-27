@@ -921,12 +921,15 @@ fn spawn_worker(screens_only: bool, stack: Option<usize>) -> std::io::Result<(us
         // and the streaming one, which is below normal itself
         // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
         let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
-        // SAFETY: a plain call on our own thread.
-        unsafe {
+        // SAFETY: plain priority calls on our own thread.
+        let (requested, effective, set) = unsafe {
             use windows::Win32::System::Threading::*;
             let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
-            let _ = SetThreadPriority(GetCurrentThread(), priority);
-        }
+            let thread = GetCurrentThread();
+            let set = SetThreadPriority(thread, priority).is_ok();
+            (priority.0, GetThreadPriority(thread), set)
+        };
+        tracing::info!(worker = slot, screens_only, requested, effective, set, "pipeline worker priority readback");
         let making = |p: Option<Arc<Pending>>| {
             let mut now = NOW.lock().unwrap_or_else(|e| e.into_inner());
             if now.len() <= slot {
