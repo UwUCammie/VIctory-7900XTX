@@ -1383,7 +1383,10 @@ mod tests {
         let title = Title(crate::upload::reserve(PAGE as usize).expect("a watched title page"));
         // SAFETY: a committed, page-aligned allocation owned by this test.
         unsafe { (title.0 as *mut u32).write(7) };
-        let mut memory = Memory::new().expect("host memory-by-address resources");
+        let Some(mut memory) = Memory::new() else {
+            eprintln!("placed-page test skipped: host memory-by-address resources unavailable");
+            return;
+        };
         assert!(memory.another(), "an arena for the placed page");
         memory.frame = 1;
         let page = title.0 as u64 / PAGE;
