@@ -32,7 +32,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::Shader;
@@ -470,8 +470,12 @@ fn slow_limit() -> usize {
 struct Queue {
     /// Requested passes over the screen (and compute passes that wait by a
     /// budget of their own, [`Pending::ahead`]): before all others, and the
-    /// only ones [`SCREEN_WORKERS`] take.
-    screen: VecDeque<Arc<Pending>>,
+    /// only ones the priority workers take.
+    urgent: VecDeque<Arc<Pending>>,
+    /// The same requested screen passes, for a worker that cannot take
+    /// compute work. A claim in either list invalidates the other entry.
+    reserved_screen: VecDeque<Arc<Pending>>,
+    reserve_screen: bool,
     early: VecDeque<Arc<Pending>>,
     /// Those of the early ones known to take long, and how many of them are
     /// being made ([`slow_limit`]).
@@ -481,9 +485,11 @@ struct Queue {
 }
 
 impl Queue {
-    const fn new() -> Self {
+    const fn new(reserve_screen: bool) -> Self {
         Self {
-            screen: VecDeque::new(),
+            urgent: VecDeque::new(),
+            reserved_screen: VecDeque::new(),
+            reserve_screen,
             early: VecDeque::new(),
             slow: VecDeque::new(),
             slow_now: 0,
@@ -494,17 +500,25 @@ impl Queue {
     /// Queues an unrequested pipeline or promotes one queued at creation.
     /// Returns whether it is new to the queue, or `None` if nothing changed.
     fn push(&mut self, p: &Arc<Pending>, priority: u8) -> Option<bool> {
-        self.push_as(p, priority, slow_limit() != usize::MAX && super::library::slow(&p.key))
+        self.push_as(
+            p,
+            priority,
+            priority == EARLY && slow_limit() != usize::MAX && super::library::slow(&p.key),
+            priority == REQUESTED && p.ahead(),
+        )
     }
 
-    fn push_as(&mut self, p: &Arc<Pending>, priority: u8, slow: bool) -> Option<bool> {
+    fn push_as(&mut self, p: &Arc<Pending>, priority: u8, slow: bool, urgent: bool) -> Option<bool> {
         let prev = p.queue_state.load(Ordering::Relaxed);
         if prev >= priority {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED && p.ahead() {
-            self.screen.push_back(p.clone());
+        if urgent {
+            self.urgent.push_back(p.clone());
+            if self.reserve_screen && p.screen {
+                self.reserved_screen.push_back(p.clone());
+            }
         } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
         } else if slow {
@@ -515,16 +529,20 @@ impl Queue {
         Some(prev == NOT_QUEUED)
     }
 
-    fn pop(&mut self, screens_only: bool, slow_limit: usize) -> Option<Arc<Pending>> {
-        // An early entry can have been promoted and claimed already.
-        let unclaimed = |list: &mut VecDeque<Arc<Pending>>| {
-            std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+    fn pop(&mut self, worker: WorkerKind, slow_limit: usize) -> Option<Arc<Pending>> {
+        // Another list can hold work that has been promoted or claimed.
+        let unclaimed = |list: &mut VecDeque<Arc<Pending>>, state| {
+            std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == state)
         };
-        let mut p = self.screen.pop_front();
-        if p.is_none() && !screens_only {
-            p = self.requested.pop_front().or_else(|| unclaimed(&mut self.early));
+        let urgent = match worker {
+            WorkerKind::Screen => &mut self.reserved_screen,
+            WorkerKind::General | WorkerKind::Urgent => &mut self.urgent,
+        };
+        let mut p = unclaimed(urgent, REQUESTED);
+        if p.is_none() && worker == WorkerKind::General {
+            p = self.requested.pop_front().or_else(|| unclaimed(&mut self.early, EARLY));
             if p.is_none() && self.slow_now < slow_limit {
-                p = unclaimed(&mut self.slow);
+                p = unclaimed(&mut self.slow, EARLY);
                 if let Some(p) = &p {
                     p.was_slow.store(true, Ordering::Relaxed);
                     self.slow_now += 1;
@@ -537,7 +555,12 @@ impl Queue {
     }
 }
 
-static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
+fn reserve_screen_worker() -> bool {
+    static RESERVE: OnceLock<bool> = OnceLock::new();
+    *RESERVE.get_or_init(|| screens_first() && std::env::var_os("VICTORY_RESERVE_SCREEN_WORKER").is_some_and(|value| value == "1"))
+}
+
+static QUEUE: LazyLock<Mutex<Queue>> = LazyLock::new(|| Mutex::new(Queue::new(reserve_screen_worker())));
 static AVAILABLE: Condvar = Condvar::new();
 
 /// Start or promote work for a draw without waiting behind the entire early
@@ -563,13 +586,20 @@ fn start(p: &Arc<Pending>, priority: u8) {
     }
 }
 
-/// Workers that make passes over the screen alone, besides the others.
-const SCREEN_WORKERS: usize = 2;
+/// Priority workers in addition to the general workers.
+const PRIORITY_WORKERS: usize = 2;
 
-fn next(screens_only: bool) -> Arc<Pending> {
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum WorkerKind {
+    General,
+    Urgent,
+    Screen,
+}
+
+fn next(worker: WorkerKind) -> Arc<Pending> {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop(screens_only, slow_limit()) {
+        if let Some(p) = queue.pop(worker, slow_limit()) {
             return p;
         }
         queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
@@ -614,7 +644,7 @@ static NOW: Mutex<Vec<Option<Arc<Pending>>>> = Mutex::new(Vec::new());
 
 /// Worker `i`: takes pipelines from the queue and makes them, for as long as
 /// the process runs.
-fn spawn_worker(i: usize, screens_only: bool, stack: Option<usize>) -> std::io::Result<std::thread::JoinHandle<()>> {
+fn spawn_worker(i: usize, worker: WorkerKind, stack: Option<usize>) -> std::io::Result<std::thread::JoinHandle<()>> {
     let mut builder = std::thread::Builder::new().name(format!("victory-pipelines-{i}"));
     if let Some(bytes) = stack {
         builder = builder.stack_size(bytes);
@@ -623,7 +653,7 @@ fn spawn_worker(i: usize, screens_only: bool, stack: Option<usize>) -> std::io::
         // Below the title's own threads (loading, recording),
         // and the streaming one, which is below normal itself
         // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
-        let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
+        let lowest = worker == WorkerKind::General && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
         // SAFETY: a plain call on our own thread.
         unsafe {
             use windows::Win32::System::Threading::*;
@@ -638,8 +668,12 @@ fn spawn_worker(i: usize, screens_only: bool, stack: Option<usize>) -> std::io::
             now[i] = p;
         };
         loop {
-            let p = next(screens_only);
+            let p = next(worker);
             making(Some(p.clone()));
+            if worker == WorkerKind::Screen {
+                static FIRST: std::sync::Once = std::sync::Once::new();
+                FIRST.call_once(|| tracing::info!("dedicated screen pipeline worker claimed its first pass"));
+            }
             p.make();
             making(None);
             if p.was_slow.load(Ordering::Relaxed) {
@@ -670,7 +704,7 @@ fn spawn_worker(i: usize, screens_only: bool, stack: Option<usize>) -> std::io::
 /// 271 ms a frame (run 13), and the six workers were gone. Given up, its
 /// draws and dispatches are dropped at once, as those of a pipeline the host
 /// refuses are.
-fn watch(mut workers: Vec<(usize, bool, std::thread::JoinHandle<()>)>, stack: Option<usize>) {
+fn watch(mut workers: Vec<(usize, WorkerKind, std::thread::JoinHandle<()>)>, stack: Option<usize>) {
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
     use windows::Win32::System::Threading::{INFINITE, WaitForMultipleObjects};
@@ -684,7 +718,7 @@ fn watch(mut workers: Vec<(usize, bool, std::thread::JoinHandle<()>)>, stack: Op
                 tracing::warn!(?ended, "the pipeline workers are watched no more");
                 return;
             }
-            let (i, screens_only, _gone) = workers.swap_remove(k);
+            let (i, kind, _gone) = workers.swap_remove(k);
             let was = NOW.lock().unwrap_or_else(|e| e.into_inner()).get_mut(i).and_then(Option::take);
             if let Some(p) = was {
                 p.lost.store(true, Ordering::Relaxed);
@@ -705,8 +739,8 @@ fn watch(mut workers: Vec<(usize, bool, std::thread::JoinHandle<()>)>, stack: Op
             } else {
                 tracing::warn!(worker = i, "a pipeline worker ended with no pipeline in the making");
             }
-            match spawn_worker(i, screens_only, stack) {
-                Ok(worker) => workers.push((i, screens_only, worker)),
+            match spawn_worker(i, kind, stack) {
+                Ok(worker) => workers.push((i, kind, worker)),
                 Err(e) => tracing::warn!(error = %e, worker = i, "no pipeline worker in its place"),
             }
         }
@@ -728,19 +762,28 @@ fn workers() -> bool {
             std::thread::available_parallelism().map_or(2, |n| n.get()),
         );
         tracing::info!(workers, "pipeline workers");
-        let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
+        let priority_workers = if screens_first() { PRIORITY_WORKERS } else { 0 };
         let stack = worker_stack();
         let mut started = Vec::new();
-        for i in 0..workers + screens {
-            let screens_only = i >= workers;
-            match spawn_worker(i, screens_only, stack) {
+        let mut reserved = false;
+        for i in 0..workers + priority_workers {
+            let kind = if i < workers {
+                WorkerKind::General
+            } else if i + 1 == workers + priority_workers && reserve_screen_worker() {
+                WorkerKind::Screen
+            } else {
+                WorkerKind::Urgent
+            };
+            match spawn_worker(i, kind, stack) {
                 Ok(worker) => {
-                    started.push((i, screens_only, worker));
+                    reserved |= kind == WorkerKind::Screen;
+                    started.push((i, kind, worker));
                     running = true;
                 }
                 Err(e) => tracing::warn!(error = %e, "no pipeline worker"),
             }
         }
+        tracing::info!(reserved, "dedicated screen pipeline worker");
         if on_wine() && std::env::var_os("VICTORY_PIPELINE_WATCH").is_none_or(|v| v != "0") {
             watch(started, stack);
         }
@@ -831,7 +874,7 @@ mod tests {
         let earlier = Arc::new(Pending::new(Vec::new(), None));
         let promoted = Arc::new(Pending::new(Vec::new(), None));
         let requested = Arc::new(Pending::new(Vec::new(), None));
-        let mut queue = Queue::new();
+        let mut queue = Queue::new(false);
 
         assert_eq!(queue.push(&earlier, EARLY), Some(true));
         assert_eq!(queue.push(&promoted, EARLY), Some(true));
@@ -839,38 +882,37 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
 
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &requested));
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &promoted));
+        assert!(Arc::ptr_eq(&queue.pop(WorkerKind::General, 1).unwrap(), &requested));
+        assert!(Arc::ptr_eq(&queue.pop(WorkerKind::General, 1).unwrap(), &promoted));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &earlier));
-        assert!(queue.pop(false, 1).is_none());
+        assert!(Arc::ptr_eq(&queue.pop(WorkerKind::General, 1).unwrap(), &earlier));
+        assert!(queue.pop(WorkerKind::General, 1).is_none());
     }
 
     #[test]
     fn pipelines_known_to_take_long_leave_workers_for_the_others() {
         let new = || Arc::new(Pending::new(Vec::new(), None));
         let (long, longer, asked, quick) = (new(), new(), new(), new());
-        let mut queue = Queue::new();
+        let mut queue = Queue::new(false);
         for p in [&long, &longer, &asked] {
-            assert_eq!(queue.push_as(p, EARLY, true), Some(true));
+            assert_eq!(queue.push_as(p, EARLY, true, false), Some(true));
         }
-        assert_eq!(queue.push_as(&quick, EARLY, false), Some(true));
+        assert_eq!(queue.push_as(&quick, EARLY, false, false), Some(true));
         // The quick one first, then one long one at a time; one a draw asks
         // for waits for nobody.
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &quick));
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &long));
-        assert!(queue.pop(false, 1).is_none());
-        assert_eq!(queue.push_as(&asked, REQUESTED, true), Some(false));
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &asked));
+        assert!(Arc::ptr_eq(&queue.pop(WorkerKind::General, 1).unwrap(), &quick));
+        assert!(Arc::ptr_eq(&queue.pop(WorkerKind::General, 1).unwrap(), &long));
+        assert!(queue.pop(WorkerKind::General, 1).is_none());
+        assert_eq!(queue.push_as(&asked, REQUESTED, true, false), Some(false));
+        assert!(Arc::ptr_eq(&queue.pop(WorkerKind::General, 1).unwrap(), &asked));
         assert!(!asked.was_slow.load(Ordering::Relaxed));
-        assert!(queue.pop(false, 1).is_none());
+        assert!(queue.pop(WorkerKind::General, 1).is_none());
         queue.slow_now -= 1;
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &longer));
-        assert!(queue.pop(false, 1).is_none());
+        assert!(Arc::ptr_eq(&queue.pop(WorkerKind::General, 1).unwrap(), &longer));
+        assert!(queue.pop(WorkerKind::General, 1).is_none());
     }
 
-    /// Passes over the screen go before all others, and workers of their own
-    /// take nothing else.
+    /// A priority worker picks a screen pass ahead of ordinary requests.
     #[test]
     fn passes_over_the_screen_go_first() {
         let of = |screen| {
@@ -879,11 +921,43 @@ mod tests {
             Arc::new(p)
         };
         let (world, screen) = (of(false), of(true));
-        let mut queue = Queue::new();
+        let mut queue = Queue::new(false);
         assert_eq!(queue.push(&world, REQUESTED), Some(true));
         assert_eq!(queue.push(&screen, REQUESTED), Some(true));
-        assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
-        assert!(queue.pop(true, 1).is_none());
-        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+        assert!(Arc::ptr_eq(&queue.pop(WorkerKind::Urgent, 1).unwrap(), &screen));
+        assert!(queue.pop(WorkerKind::Urgent, 1).is_none());
+        assert!(Arc::ptr_eq(&queue.pop(WorkerKind::General, 1).unwrap(), &world));
+    }
+
+    #[test]
+    fn a_reserved_screen_worker_can_pass_urgent_compute() {
+        let compute = Arc::new(Pending::new(Vec::new(), None));
+        let mut pipeline = Pending::new(Vec::new(), None);
+        pipeline.screen = true;
+        let screen = Arc::new(pipeline);
+        let mut queue = Queue::new(true);
+
+        assert_eq!(queue.push_as(&compute, REQUESTED, false, true), Some(true));
+        assert!(queue.pop(WorkerKind::Screen, 1).is_none());
+        assert_eq!(queue.push_as(&screen, EARLY, false, false), Some(true));
+        assert_eq!(queue.push_as(&screen, REQUESTED, false, true), Some(false));
+        assert!(Arc::ptr_eq(&queue.pop(WorkerKind::Screen, 1).unwrap(), &screen));
+        assert!(Arc::ptr_eq(&queue.pop(WorkerKind::Urgent, 1).unwrap(), &compute));
+        assert!(queue.pop(WorkerKind::General, 1).is_none());
+    }
+
+    #[test]
+    fn shared_workers_keep_urgent_order_and_consume_the_reserved_entry_once() {
+        let compute = Arc::new(Pending::new(Vec::new(), None));
+        let mut pipeline = Pending::new(Vec::new(), None);
+        pipeline.screen = true;
+        let screen = Arc::new(pipeline);
+        let mut queue = Queue::new(true);
+
+        assert_eq!(queue.push_as(&compute, REQUESTED, false, true), Some(true));
+        assert_eq!(queue.push_as(&screen, REQUESTED, false, true), Some(true));
+        assert!(Arc::ptr_eq(&queue.pop(WorkerKind::Urgent, 1).unwrap(), &compute));
+        assert!(Arc::ptr_eq(&queue.pop(WorkerKind::General, 1).unwrap(), &screen));
+        assert!(queue.pop(WorkerKind::Screen, 1).is_none());
     }
 }
