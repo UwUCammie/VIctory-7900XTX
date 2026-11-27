@@ -261,8 +261,6 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         Does::Fill { to: false, .. } => Err("a fill of memory the card cannot be given the bytes of"),
         _ => Ok(()),
     };
-    let mut taken = vec![false; does.len()];
-    let (mut read, mut written) = (Vec::new(), Vec::new());
     let mut more = Vec::new();
     for (i, d) in does.iter().enumerate() {
         match *d {
@@ -272,6 +270,12 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
             _ => {}
         }
     }
+    // Every dependency originates in an initially requested step.
+    if more.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut taken = vec![false; does.len()];
+    let (mut read, mut written) = (Vec::new(), Vec::new());
     while !more.is_empty() {
         // (Joined once for the round: one by one the 2,800 fills of a frame
         // sorted the ranges each time, 16 ms of the submitting thread.)
