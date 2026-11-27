@@ -2023,6 +2023,23 @@ mod tests {
         assert_ne!(words(at), words(other.as_ptr() as u64));
     }
 
+    #[test]
+    fn placed_buffer_padding_preserves_srv_and_uav_fields() {
+        let resource = std::array::from_fn(|index| 0x3800_0000 + index as u32);
+        let mut canonical_resource = resource;
+        (canonical_resource[1], canonical_resource[13]) = (0, 0);
+
+        let mut desc = std::array::from_fn(|index| 0x2700_0000 + index as u32);
+        desc[1] = 1; // D3D12_SRV_DIMENSION_BUFFER and D3D12_UAV_DIMENSION_BUFFER.
+        let mut canonical_srv = desc;
+        (canonical_srv[3], canonical_srv[9]) = (0, 0);
+        let mut canonical_uav = desc;
+        canonical_uav[9] = 0;
+        assert_eq!(placed(false, resource, desc), View::Placed(false, canonical_resource, canonical_srv));
+        // For the UAV, word 3 is the high half of FirstElement. Only word 9 is padding.
+        assert_eq!(placed(true, resource, desc), View::Placed(true, canonical_resource, canonical_uav));
+    }
+
     /// A released resource's views go stale; the same view of a new
     /// resource at the same address is a new record.
     #[test]
