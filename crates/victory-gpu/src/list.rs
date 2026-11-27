@@ -254,7 +254,11 @@ fn pool_on_create() -> bool {
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_LIST_CREATE_POOL") { return on; }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_CREATE_POOL").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| {
+        let reuse = std::env::var_os("VICTORY_LIST_CREATE_POOL").is_none_or(|v| v != "0");
+        tracing::info!(reuse, "host list reuse at construction");
+        reuse
+    })
 }
 
 #[cfg(windows)]
@@ -2571,6 +2575,44 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a D3D12 device"]
+    fn a_completed_host_list_can_be_reused_at_replay_construction() {
+        use windows::core::Interface;
+
+        assert!(pools());
+        let host = crate::host::host().expect("a D3D12 device");
+        let finished = host.new_list().expect("a host list");
+        let identity = Interface::as_raw(&*finished.list);
+        finished.close();
+        host.execute(&[&finished]);
+        // SAFETY: the host device is live, and the submission has completed.
+        unsafe { host.device.GetDeviceRemovedReason() }.expect("the device is healthy");
+        recycle(
+            vec![Detached {
+                host: finished,
+                _uploads: Vec::new(),
+                _state: crate::draw::State::default(),
+            }],
+            &[0],
+        );
+        assert_eq!(IDLE.lock().unwrap().0.len(), 1);
+        let thin = boxed(0, std::ptr::null(), true);
+        assert!(thin.host.is_none());
+        assert_eq!(IDLE.lock().unwrap().0.len(), 1);
+
+        let ready = boxed(0, std::ptr::null(), false);
+        let list = ready.host.as_ref().expect("an open host list");
+        let reused = std::env::var_os("VICTORY_LIST_CREATE_POOL").is_none_or(|v| v != "0");
+        assert_eq!(Interface::as_raw(&*list.list) == identity, reused);
+        assert_eq!(IDLE.lock().unwrap().0.len(), usize::from(!reused));
+        list.close();
+        host.execute(&[list]);
+        // SAFETY: as above. The second submission uses the materialized list.
+        unsafe { host.device.GetDeviceRemovedReason() }.expect("the device is healthy");
     }
 
     /// An offset near `u64::MAX` must not overflow and write outside the
