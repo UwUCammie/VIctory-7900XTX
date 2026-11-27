@@ -68,6 +68,17 @@ pub fn run(
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    // PC FidelityFX at the title's own resolution (`VICTORY_PC_FSR=1`), without
+    // the 4K preset: ported from Belobug #532. The provider is selected before
+    // the first lookup builds the import registry.
+    if fsr.is_none() && execute && std::env::var_os("VICTORY_PC_FSR").is_some_and(|value| value == "1") {
+        let dir = cfg.fidelityfx_dir.as_deref().context(
+            "PC FidelityFX requires amd_fidelityfx_upscaler_dx12.dll. Set VICTORY_FIDELITYFX_DIR or [paths].fidelityfx_dir to its folder.",
+        )?;
+        victory_hle::modules::fidelityfx::use_host_dir(dir)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("loading the PC FSR upscaler from {}", dir.display()))?;
+    }
     let image = if let Some(preset) = fsr {
         anyhow::ensure!(matches!(console, Console::SeriesX), "FSR 4K requires Series X mode");
         fsr_4k::prepare_fsr_4k(&mut prepared, preset)?;

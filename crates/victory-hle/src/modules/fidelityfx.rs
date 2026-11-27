@@ -298,6 +298,19 @@ fn is_fsr_4_1_2(name: &str) -> bool {
         .is_some_and(|suffix| !suffix.starts_with(|c: char| c.is_ascii_digit()))
 }
 
+/// Any FSR 4 family provider (`4.<minor>.<patch>`, with the SDK's ` *` mark
+/// allowed after it). The Linux shim offers 4.1.1 where 4.1.2 is not shipped.
+fn is_fsr_4(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("4.") else { return false };
+    let core = rest.trim_end_matches(" *");
+    let parts: Vec<&str> = core.split('.').collect();
+    parts.len() == 2
+        && parts.iter().all(|part| {
+            let digits = part.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+            !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+        })
+}
+
 /// The SDK supplies the version id to put in the context creation chain.
 fn select_version(query_fn: Call, device: &ID3D12Device) -> Result<(u64, String), String> {
     let mut count = 0u64;
@@ -331,6 +344,7 @@ fn select_version(query_fn: Call, device: &ID3D12Device) -> Result<(u64, String)
         ));
     }
     let mut available = Vec::new();
+    let mut fallback: Option<(u64, String)> = None;
     for (id, name) in ids.into_iter().zip(names).take(count as usize) {
         if !name.is_null() {
             // SAFETY: NUL-terminated name owned by the SDK.
@@ -340,8 +354,14 @@ fn select_version(query_fn: Call, device: &ID3D12Device) -> Result<(u64, String)
             if is_fsr_4_1_2(&name) {
                 return Ok((id, name));
             }
+            if is_fsr_4(&name) && fallback.is_none() {
+                fallback = Some((id, name.clone()));
+            }
             available.push(name);
         }
+    }
+    if let Some((id, name)) = fallback {
+        return Ok((id, name));
     }
     Err(format!(
         "no FSR 4.1.2 provider for this adapter (available: {})",
@@ -442,7 +462,7 @@ extern "C" fn ffxCreateContext(
         .then(|| unsafe { CStr::from_ptr(version.name) }.to_string_lossy());
     if query_code != OK
         || version.id != host.provider_id
-        || !name.as_deref().is_some_and(is_fsr_4_1_2)
+        || !name.as_deref().is_some_and(|n| is_fsr_4_1_2(n) || is_fsr_4(n))
     {
         tracing::warn!(
             query_code,
