@@ -267,11 +267,11 @@ impl FrameWaits {
     /// however many wait. (A thread that read the frame before a newer one
     /// began counts in the newer one: it must not give that frame a second
     /// budget.)
-    fn begin(&mut self, now: Instant, frame: u64) -> Duration {
+    fn begin(&mut self, now: Instant, frame: u64) -> Option<Instant> {
         if self.frame == u64::MAX || frame > self.frame {
             *self = FrameWaits { frame, until: Some(now + COMPUTE_BUDGET) };
         }
-        self.until.map_or(Duration::ZERO, |until| until.saturating_duration_since(now))
+        self.until.filter(|until| *until > now)
     }
 }
 
@@ -309,45 +309,45 @@ fn wait(p: &Arc<Pending>, frame: u64) {
     // A compute dispatch ([`compute_waits`]) of a pipeline that has not had
     // its wait waits within the frame's compute budget; with that spent, or
     // after its wait, as any other. The pipeline it waits for is made next.
-    let allowed = if p.compute && !p.compute_waited.load(Ordering::Relaxed) {
+    let compute_deadline = if p.compute && !p.compute_waited.load(Ordering::Relaxed) {
         static WAITS: Mutex<FrameWaits> = Mutex::new(FrameWaits::new());
         WAITS.lock().unwrap_or_else(|e| e.into_inner()).begin(Instant::now(), frame)
     } else {
-        Duration::ZERO
+        None
     };
-    let compute = !allowed.is_zero();
+    let compute = compute_deadline.is_some();
     if compute {
         QUEUE.lock().unwrap_or_else(|e| e.into_inner()).hurry(p);
-    }
-    let budget = if screen {
-        screen_budget()
-    } else if compute {
-        allowed
-    } else {
-        wait_budget()
-    };
-    if budget.is_zero() {
-        return;
     }
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now); of the passes over the screen too.
     static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((0, Duration::ZERO)) }; 2];
     let spent_of = &SPENT[usize::from(screen)];
     let shared = shared_budget();
-    let left = if compute {
-        allowed
+    let left = if let Some(until) = compute_deadline {
+        until.saturating_duration_since(Instant::now())
     } else {
+        let budget = if screen { screen_budget() } else { wait_budget() };
+        if budget.is_zero() {
+            return;
+        }
         let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
         reserve_wait(&mut spent, frame, budget, shared)
     };
-    if left.is_zero() {
+    if left.is_zero() && !compute {
         return;
     }
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
-        let rest = left.saturating_sub(started.elapsed());
+        // Queuing and taking either lock can delay this thread. Keep the
+        // original frame deadline throughout the compute wait.
+        let rest = if let Some(until) = compute_deadline {
+            until.saturating_duration_since(Instant::now())
+        } else {
+            left.saturating_sub(started.elapsed())
+        };
         if rest.is_zero() {
             break;
         }
@@ -892,11 +892,16 @@ mod tests {
         let ms = Duration::from_millis;
         let t0 = Instant::now();
         let mut w = FrameWaits::new();
-        assert_eq!(w.begin(t0, 7), COMPUTE_BUDGET);
-        assert_eq!(w.begin(t0 + ms(100), 7), COMPUTE_BUDGET - ms(100));
-        assert_eq!(w.begin(t0 + COMPUTE_BUDGET, 7), Duration::ZERO);
-        assert_eq!(w.begin(t0 + COMPUTE_BUDGET, 8), COMPUTE_BUDGET);
-        assert_eq!(w.begin(t0 + COMPUTE_BUDGET + ms(50), 7), COMPUTE_BUDGET - ms(50));
+        let until = t0 + COMPUTE_BUDGET;
+        assert_eq!(w.begin(t0, 7), Some(until));
+        let deadline = w.begin(t0 + ms(100), 7).unwrap();
+        assert_eq!(deadline, until);
+        assert_eq!(deadline.saturating_duration_since(until - ms(50)), ms(50));
+        assert_eq!(deadline.saturating_duration_since(until + ms(50)), Duration::ZERO);
+        assert_eq!(w.begin(until, 7), None);
+        let next_until = until + COMPUTE_BUDGET;
+        assert_eq!(w.begin(until, 8), Some(next_until));
+        assert_eq!(w.begin(until + ms(50), 7), Some(next_until));
     }
 
     /// A compute pipeline that is never made (a worker stuck in its compile)
