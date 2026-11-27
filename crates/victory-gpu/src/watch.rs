@@ -3716,7 +3716,18 @@ pub fn title_memory_freed(at: usize, len: usize) {
     let first = at / BLOCK;
     let opened_first = {
         let opened = g.opened.lock().unwrap_or_else(|e| e.into_inner());
-        opened.keys().copied().filter(|&b| b >= first).min()
+        if opened.is_empty() {
+            None
+        } else if len != 0 {
+            let last = at.saturating_add(len).div_ceil(BLOCK);
+            if last.saturating_sub(first) <= 64 {
+                (first..last).find(|b| opened.contains_key(b))
+            } else {
+                opened.keys().copied().filter(|&b| b >= first).min()
+            }
+        } else {
+            opened.keys().copied().filter(|&b| b >= first).min()
+        }
     };
     let noted = [
         g.protected.range(first..).next(),
@@ -3748,22 +3759,14 @@ pub fn title_memory_freed(at: usize, len: usize) {
     for block in foreign {
         g.foreign.remove(&block);
     }
-    let aliased: Vec<usize> = g.aliased.range(first..end).collect();
-    for block in aliased {
-        g.aliased.remove(block);
-    }
+    // (Memory that is still a view is not freed by that call, which fails:
+    // it must not stay read-only. Open while `g.aliased` is still intact so
+    // sibling views of the same physical pages are invalidated too.)
+    open(&g, at, end * BLOCK);
     for block in BESIDE.set_in(first, end) {
         BESIDE.clear(block);
     }
-    {
-        let mut opened = g.opened.lock().unwrap_or_else(|e| e.into_inner());
-        if !opened.is_empty() {
-            opened.retain(|block, _| !(first..end).contains(block));
-        }
-    }
-    // (Memory that is still a view is not freed by that call, which fails:
-    // it must not stay read-only.)
-    open(&g, at, end * BLOCK);
+    forget_opened(&g, first..end);
 }
 
 /// The end of the allocation at `at`, if `inside` lies in it; else `at`.
@@ -3797,6 +3800,20 @@ fn forget_views(first: usize, last: usize) {
     }
 }
 
+fn forget_opened(g: &Guards, range: std::ops::Range<usize>) {
+    let mut opened = g.opened.lock().unwrap_or_else(|e| e.into_inner());
+    if opened.is_empty() {
+        return;
+    }
+    if range.end.saturating_sub(range.start) <= 64 {
+        for block in range {
+            opened.remove(&block);
+        }
+    } else {
+        opened.retain(|block, _| !range.contains(block));
+    }
+}
+
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
 fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'static, Guards> {
@@ -3825,14 +3842,10 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'s
         g.aliased.remove(block);
     }
     for block in BESIDE.set_in(range.start, range.end) {
+        PUBLISHED.clear(block);
         BESIDE.clear(block);
     }
-    {
-        let mut opened = g.opened.lock().unwrap_or_else(|e| e.into_inner());
-        if !opened.is_empty() {
-            opened.retain(|block, _| !range.contains(block));
-        }
-    }
+    forget_opened(&g, range);
     g
 }
 
@@ -5381,6 +5394,19 @@ mod tests {
         assert!(BESIDE.any(one / BLOCK, one / BLOCK + 1) && guards().aliased.contains(one / BLOCK));
         title_memory_freed(one, BLOCK);
         assert!(!BESIDE.any(one / BLOCK, one / BLOCK + 1) && !guards().aliased.contains(one / BLOCK));
+        drop_views(section, &[one, two], BLOCK);
+
+        // Case 2b: freeing a live aliased view must still invalidate sibling views
+        // (when VirtualFree fails on a view, writes through `one` must be seen at `two`).
+        let (section, one, two) = two_views(BLOCK);
+        assert!(writes(one, one + BLOCK, true).is_some() && writes(two, two + BLOCK, true).is_some());
+        assert!(published(two, two + BLOCK) && guards().aliased.contains(one / BLOCK));
+        title_memory_freed(one, BLOCK);
+        assert!(!guards().aliased.contains(one / BLOCK) && writable(one));
+        assert!(!published(two, two + BLOCK), "sibling view must be invalidated when freed view opens");
+        // SAFETY: `one` stays mapped (as when VirtualFree fails on a view) and is now writable.
+        unsafe { ((one + 16) as *mut u8).write(0x77) };
+        assert_eq!(guard(two, two + BLOCK), Some(vec![two / PAGE]));
         drop_views(section, &[one, two], BLOCK);
 
         // Case 3: len == 0 (whole allocation via allocation_end) clears block 0 only.
