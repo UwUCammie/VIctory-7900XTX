@@ -551,21 +551,29 @@ pub(crate) fn pipeline(
 ) -> windows::core::Result<ID3D12PipelineState> {
     let create = || {
         let _creating = crate::timeline::span("pipeline: create a PSO in the driver");
-        create()
+        let result = create();
+        super::timing::phase("after_driver");
+        result
     };
+    super::timing::phase("library");
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
+        super::timing::phase("driver_create");
         return create();
     };
     let began = std::time::Instant::now();
     let loaded = {
+        super::timing::phase("library_load_guards");
         let mut loading = crate::timeline::span("pipeline: acquire library load guards");
         let _all = one_call();
         let _one = same_name(name);
         let _call = call("load", name);
         loading.next("pipeline: load a PSO from the driver library");
-        load(&library.library, PCWSTR(wide.as_ptr()))
+        super::timing::phase("driver_load");
+        let result = load(&library.library, PCWSTR(wide.as_ptr()));
+        super::timing::phase("after_driver");
+        result
     };
     // The load read the library's file (see `trim`).
     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
@@ -584,6 +592,7 @@ pub(crate) fn pipeline(
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
+        super::timing::phase("driver_create");
         create()?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
@@ -595,15 +604,18 @@ pub(crate) fn pipeline(
         )
     });
     let mut storing = crate::timeline::span("pipeline: acquire library store guards");
+    super::timing::phase("library_store_guards");
     let _all = one_call();
     let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
     let _call = call("store", name);
     storing.next("pipeline: store a PSO in the driver library");
+    super::timing::phase("driver_store");
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
     if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
         library.added.fetch_add(1, Ordering::Relaxed);
     }
+    super::timing::phase("after_driver");
     Ok(pso)
 }
 

@@ -771,6 +771,8 @@ pub mod known;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+mod timing;
 pub(crate) use make::on_wine;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
