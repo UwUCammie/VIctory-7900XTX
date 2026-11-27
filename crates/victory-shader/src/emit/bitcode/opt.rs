@@ -229,16 +229,17 @@ pub(super) fn effect(f: &Func) -> Effect {
 impl Module {
     /// Runs the clean-up passes named in `passes` ([`ALL`]: every one).
     pub(crate) fn optimise(&mut self, passes: u32) {
-        if passes & (FOLD | REUSE | FACTS | LOADS) != 0 {
+        if !self.blocks.is_empty() && passes & (FOLD | REUSE | FACTS | LOADS) != 0 {
+            let effects = self.effects();
+            let mut tree = None;
             // Values merged in one round can make two joins the same in
-            // the next (a loop's registers that only go round), and a
-            // branch that goes one way leaves blocks with one way in.
+            // the next. Only pruning a branch changes the tree.
             for _ in 0..4 {
-                let mut changed = self.merge(passes);
-                if passes & FOLD != 0 {
-                    changed |= self.prune();
-                }
-                if !changed {
+                let dom = tree.get_or_insert_with(|| self.dominator_tree());
+                let changed = self.merge(passes, &effects, dom);
+                if passes & FOLD != 0 && self.prune() {
+                    tree = None;
+                } else if !changed {
                     break;
                 }
             }
@@ -752,12 +753,7 @@ impl Module {
 
     /// [`FOLD`], [`REUSE`], [`FACTS`] and [`LOADS`]: one walk over the
     /// dominator tree. Returns whether anything changed.
-    fn merge(&mut self, passes: u32) -> bool {
-        if self.blocks.is_empty() {
-            return false;
-        }
-        let effects = self.effects();
-        let tree = self.dominator_tree();
+    fn merge(&mut self, passes: u32, effects: &[Effect], tree: &Tree) -> bool {
         let mut repl: Vec<Option<V>> = vec![None; self.insts.len()];
         let mut changed = false;
         // Joins of one value: until none is left (one gone can leave
@@ -871,9 +867,8 @@ impl Module {
                     }
                 }
             }
-            let body = std::mem::take(&mut self.blocks[b].body);
-            let mut kept = Vec::with_capacity(body.len());
-            for i in body {
+            let mut body = std::mem::take(&mut self.blocks[b].body);
+            body.retain(|&i| {
                 map_operands(&mut self.insts[i as usize].op, |v| {
                     let v = resolve(&repl, v);
                     let bit = known_bit(&facts, v);
@@ -885,16 +880,16 @@ impl Module {
                 {
                     repl[i as usize] = Some(if holds { yes } else { no });
                     changed = true;
-                    continue;
+                    return false;
                 }
                 if passes & FOLD != 0
                     && let Some(v) = self.simplify(i, &mut changed)
                 {
                     repl[i as usize] = Some(v);
                     changed = true;
-                    continue;
+                    return false;
                 }
-                let class = self.class(&effects, i);
+                let class = self.class(effects, i);
                 if passes & REUSE != 0
                     && class == Effect::Pure
                     && let Some(key) = self.key(i)
@@ -902,7 +897,7 @@ impl Module {
                     if let Some(&first) = known.get(&key) {
                         repl[i as usize] = Some(first);
                         changed = true;
-                        continue;
+                        return false;
                     }
                     known.insert(key.clone(), V::Inst(i));
                     added.push(key);
@@ -916,16 +911,16 @@ impl Module {
                     if let Some(&first) = read.get(&key) {
                         repl[i as usize] = Some(first);
                         changed = true;
-                        continue;
+                        return false;
                     }
                     read.insert(key, V::Inst(i));
                 }
                 if class == Effect::Writes {
                     read.clear();
                 }
-                kept.push(i);
-            }
-            self.blocks[b].body = kept;
+                true
+            });
+            self.blocks[b].body = body;
             if let Some(Term::CondBr(c, t, f)) = self.blocks[b].term {
                 let c = known_bit(&facts, resolve(&repl, c));
                 self.blocks[b].term = Some(Term::CondBr(c, t, f));
