@@ -273,15 +273,27 @@ pub(crate) fn early(p: &Arc<Pending>) {
     static MAX_BYTES: OnceLock<usize> = OnceLock::new();
     let small_compute = p.compute && p.shaders.first().is_some_and(|shader| {
         let limit = MAX_BYTES.get_or_init(|| {
-            std::env::var("VICTORY_EARLY_COMPUTE_MAX_BYTES").ok()
-                .and_then(|value| value.trim().parse().ok()).unwrap_or(0)
+            let bytes = std::env::var("VICTORY_EARLY_COMPUTE_MAX_BYTES")
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0);
+            tracing::info!(bytes, "cold compute pipeline byte limit");
+            bytes
         });
-        shader.container.len() <= *limit
+        within_early_compute_limit(shader.container.len(), *limit)
     });
-    if !p.shaders.is_empty() && (small_compute || super::library::wanted_early(&p.key)) {
+    if small_compute || (!p.shaders.is_empty() && super::library::wanted_early(&p.key)) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
+        if small_compute {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| tracing::info!("first small compute pipeline started at creation"));
+        }
     }
+}
+
+fn within_early_compute_limit(bytes: usize, limit: usize) -> bool {
+    bytes != 0 && bytes <= limit
 }
 
 /// Whether the frame's budget is one for all threads together: a thread
@@ -867,6 +879,15 @@ mod tests {
         assert_eq!(compute_deadline(&mut current, 7, later, budget), until);
         assert_eq!(compute_deadline(&mut current, 8, later, budget), until);
         assert_eq!(compute_deadline(&mut current, 9, later, budget), later + budget);
+    }
+
+    #[test]
+    fn early_compute_limit_excludes_empty_and_oversized_containers() {
+        assert!(!within_early_compute_limit(0, 0));
+        assert!(!within_early_compute_limit(0, 1024));
+        assert!(!within_early_compute_limit(1024, 0));
+        assert!(within_early_compute_limit(1024, 1024));
+        assert!(!within_early_compute_limit(1025, 1024));
     }
 
     #[test]
