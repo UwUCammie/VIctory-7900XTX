@@ -3717,7 +3717,10 @@ impl State {
                 host.dynamic_word(index, crate::descriptor::view(table + u64::from(k) * 32).as_ref());
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.
+                // The cache uses the title's format. Half moves need the
+                // unsigned view made in the table path below.
                 if list_views
+                    && !half.contains(&(slot, k * 8))
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
                     && let Some(mut listed) = host.make_listed(recording, words, index)
                 {
