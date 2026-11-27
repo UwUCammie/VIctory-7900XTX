@@ -4153,6 +4153,24 @@ fn hand_back(back: &[Declared]) {
 }
 
 impl Host {
+    /// Whether this host device supports the anisotropic point-mip filter.
+    pub(crate) fn aniso_point_mip(&self) -> bool {
+        static SUPPORTED: OnceLock<bool> = OnceLock::new();
+        *SUPPORTED.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+            // SAFETY: the query writes the structure of the given size.
+            // Older runtimes can refuse OPTIONS19; treat that as no support.
+            let queried = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS19,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            };
+            queried.is_ok() && options.AnisoFilterWithPointMipSupported.as_bool()
+        })
+    }
+
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {
