@@ -267,6 +267,13 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+#[derive(Default)]
+struct ValueUses<'a> {
+    instructions: Vec<&'a Inst>,
+    phi_results: Vec<Value>,
+    numeric: bool,
+}
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -281,9 +288,8 @@ struct Lower<'a> {
     lane_bits: HashMap<Value, V>,
     /// IR phi location by value.
     phi_at: HashMap<Value, (usize, usize)>,
-    /// Scalar and vector instructions that read each value, built on the
-    /// first descriptor query. Phi inputs also have entries, possibly empty.
-    numeric_uses: OnceCell<HashMap<Value, Vec<&'a Inst>>>,
+    /// Instructions and phi nodes that read each value, indexed on demand.
+    value_uses: OnceCell<HashMap<Value, ValueUses<'a>>>,
     /// Descriptor dwords with no host value (addresses, formats, all of a constant
     /// buffer's): no program reads them as numbers ([`Self::dead`]).
     stale: HashSet<Value>,
@@ -2090,7 +2096,7 @@ impl<'a> Lower<'a> {
             bools: HashMap::new(),
             lane_bits: HashMap::new(),
             phi_at,
-            numeric_uses: OnceCell::new(),
+            value_uses: OnceCell::new(),
             mask_phis: HashMap::new(),
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
@@ -3366,22 +3372,25 @@ impl<'a> Lower<'a> {
         self.s.m.extract(entry, r, index % 4)
     }
 
-    fn numeric_uses(&self) -> &HashMap<Value, Vec<&'a Inst>> {
-        self.numeric_uses.get_or_init(|| {
-            let mut uses: HashMap<Value, Vec<&Inst>> = HashMap::new();
+    fn value_uses(&self) -> &HashMap<Value, ValueUses<'a>> {
+        self.value_uses.get_or_init(|| {
+            let mut uses = HashMap::<Value, ValueUses<'_>>::new();
             for block in &self.x.p.blocks {
                 for phi in &block.phis {
                     for &arg in &phi.args {
-                        uses.entry(arg).or_default();
+                        let results = &mut uses.entry(arg).or_default().phi_results;
+                        if results.last() != Some(&phi.value) {
+                            results.push(phi.value);
+                        }
                     }
                 }
                 for inst in &block.insts {
-                    if matches!(inst.fields, Fields::Sop { .. } | Fields::Valu(_)) {
-                        for &(_, value) in &inst.reads {
-                            let readers = uses.entry(value).or_default();
-                            if readers.last().is_none_or(|last| !std::ptr::eq(*last, inst)) {
-                                readers.push(inst);
-                            }
+                    let numeric = matches!(inst.fields, Fields::Sop { .. } | Fields::Valu(_));
+                    for &(_, value) in &inst.reads {
+                        let readers = uses.entry(value).or_default();
+                        readers.numeric |= numeric;
+                        if readers.instructions.last().is_none_or(|last| !std::ptr::eq(*last, inst)) {
+                            readers.instructions.push(inst);
                         }
                     }
                 }
@@ -3393,7 +3402,9 @@ impl<'a> Lower<'a> {
     /// Whether some instruction reads `v` as a number (or may, through a
     /// join), rather than in a descriptor operand.
     fn read_as_number(&self, v: Value) -> bool {
-        self.numeric_uses().contains_key(&v)
+        self.value_uses()
+            .get(&v)
+            .is_some_and(|uses| uses.numeric || !uses.phi_results.is_empty())
     }
 
     /// Whether some instruction computes with `v` (scalar or vector
@@ -3402,7 +3413,8 @@ impl<'a> Lower<'a> {
     /// waterfall loop keeps a descriptor's dwords per lane, reads the first
     /// lane's back and compares the lanes' with them.
     fn computed_with(&self, v: Value, depth: u32) -> bool {
-        self.numeric_uses().get(&v).into_iter().flatten().any(|i| {
+        let reads = self.value_uses().get(&v).into_iter().flat_map(|uses| &uses.instructions);
+        reads.filter(|i| matches!(i.fields, Fields::Sop { .. } | Fields::Valu(_))).any(|i| {
             let name = i.name();
             let moves = matches!(
                 name,

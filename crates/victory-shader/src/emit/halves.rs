@@ -23,44 +23,43 @@ impl<'a> Lower<'a> {
         let mut used = false;
         let mut seen = HashSet::from([value]);
         let mut todo = vec![value];
+        let all_uses = self.value_uses();
         while let Some(value) = todo.pop() {
-            for b in &p.blocks {
-                for phi in b.phis.iter().filter(|phi| phi.args.contains(&value)) {
-                    if seen.insert(phi.value) {
-                        todo.push(phi.value);
-                    }
+            let Some(uses) = all_uses.get(&value) else {
+                continue;
+            };
+            for &result in &uses.phi_results {
+                if seen.insert(result) {
+                    todo.push(result);
                 }
-                for i in &b.insts {
-                    if !i.reads.iter().any(|r| r.1 == value) {
-                        continue;
-                    }
-                    let operands = crate::ir::operand_reads(p, i);
-                    let regs: Vec<Reg> = i
-                        .reads
-                        .iter()
-                        .filter(|r| r.1 == value && operands.contains(&r.0))
-                        .map(|r| r.0)
-                        .collect();
-                    if regs.is_empty() {
-                        continue;
-                    }
-                    used = true;
-                    let Fields::Valu(v) = &i.fields else {
-                        return false;
-                    };
-                    match i.name() {
-                        "v_cvt_f32_f16" => {}
-                        "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
-                            let whole = v.src.iter().enumerate().any(|(k, op)| {
-                                matches!(*op, Operand::Vector { reg, .. } if regs.contains(&Reg::V(reg)))
-                                    && v.opsel_hi >> k & 1 == 0
-                            });
-                            if whole {
-                                return false;
-                            }
+            }
+            for &i in &uses.instructions {
+                let operands = crate::ir::operand_reads(p, i);
+                let regs: Vec<Reg> = i
+                    .reads
+                    .iter()
+                    .filter(|r| r.1 == value && operands.contains(&r.0))
+                    .map(|r| r.0)
+                    .collect();
+                if regs.is_empty() {
+                    continue;
+                }
+                used = true;
+                let Fields::Valu(v) = &i.fields else {
+                    return false;
+                };
+                match i.name() {
+                    "v_cvt_f32_f16" => {}
+                    "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
+                        let whole = v.src.iter().enumerate().any(|(k, op)| {
+                            matches!(*op, Operand::Vector { reg, .. } if regs.contains(&Reg::V(reg)))
+                                && v.opsel_hi >> k & 1 == 0
+                        });
+                        if whole {
+                            return false;
                         }
-                        _ => return false,
                     }
+                    _ => return false,
                 }
             }
         }
