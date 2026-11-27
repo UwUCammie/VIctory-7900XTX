@@ -4633,7 +4633,7 @@ impl Shadow {
     /// a copy has no other use for), as [`Shadow::merge_under_writes`].
     /// `title` is scratch memory. Returns the bytes written to title
     /// memory.
-    pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
+    pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>, was: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
         let Some(card) = &self.card else {
             return 0;
@@ -4663,7 +4663,9 @@ impl Shadow {
         title.clear();
         title.resize(n, 0);
         let mapped = crate::host::read_into((start + at) as *const u8, title);
-        let was = title.clone();
+        if mapped {
+            was.clone_from(title);
+        }
         // Even without a mapped title address, retain the latest card bytes
         // in the CPU's reference. In that case `title` is only scratch.
         let changed = if skip.is_empty() {
@@ -4679,7 +4681,7 @@ impl Shadow {
         if !mapped || !changed {
             return 0;
         }
-        put_changed(start + at, &was, title)
+        put_changed(start + at, was, title)
     }
 }
 
@@ -4933,9 +4935,9 @@ mod land_tests {
                     *card.sent.lock().unwrap() = super::SentRuns::of(&sent);
                 }
                 let pieces: Vec<(usize, usize)> = (0..3).map(|p| (p * PIECE + 16, (p + 1) * PIECE - 4)).collect();
-                let mut scratch = Vec::new();
+                let (mut scratch, mut was) = (Vec::new(), Vec::new());
                 for &(lo, hi) in &pieces {
-                    one.card_merge_relay(lo, &now[lo..hi], after, &mut scratch);
+                    one.card_merge_relay(lo, &now[lo..hi], after, &mut scratch, &mut was);
                 }
                 let addressed: Vec<(usize, usize, usize)> =
                     pieces.iter().map(|&(lo, hi)| (lo, hi, now.as_ptr() as usize + lo)).collect();
