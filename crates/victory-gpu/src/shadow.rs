@@ -350,7 +350,11 @@ fn touched_only() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_TOUCHED").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        let enabled = std::env::var_os("VICTORY_CARD_TOUCHED").is_some_and(|v| v == "1");
+        tracing::info!(enabled, "card copy dirty scan mode");
+        enabled
+    })
 }
 
 /// Puts a copy that has a card side in [`CARDED`], and tells it what it is
@@ -4996,7 +5000,7 @@ impl Shadow {
 #[cfg(test)]
 mod land_tests {
     use super::{Card, PIECE, Shadow};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     /// A copy in the card's memory of title memory at `title` (its card side
@@ -5042,6 +5046,39 @@ mod land_tests {
         *seed ^= *seed >> 7;
         *seed ^= *seed << 17;
         (*seed >> 8) as usize
+    }
+
+    #[test]
+    fn dirty_card_ranges_survive_registration_and_are_consumed_once() {
+        let make_copy = || copy_of(memory(PIECE, false), PIECE).map(Arc::new);
+        let Some(before_registration) = make_copy() else {
+            return; // no host GPU
+        };
+        let after_registration = make_copy().expect("second host buffer");
+        let clean = make_copy().expect("third host buffer");
+
+        before_registration.resend(4, 20);
+        super::carded(&before_registration);
+        super::carded(&after_registration);
+        super::carded(&clean);
+        after_registration.resend(32, 52);
+        after_registration.resend(48, 64);
+
+        let dirty = super::card_dirty(1);
+        assert_eq!(dirty.len(), 2);
+        for (copy, range) in [(&before_registration, (4, 20)), (&after_registration, (32, 64))] {
+            let entry = dirty.iter().find(|(shadow, _)| Arc::ptr_eq(shadow, copy)).expect("dirty copy");
+            assert_eq!(entry.1, [range]);
+        }
+        assert!(super::card_dirty(2).is_empty());
+
+        after_registration.resend(64, 68);
+        let dirty = super::card_dirty(3);
+        assert_eq!(dirty.len(), 1);
+        assert!(Arc::ptr_eq(&dirty[0].0, &after_registration));
+        assert_eq!(dirty[0].1, [(64, 68)]);
+        assert!(super::card_dirty(4).is_empty());
+        eprintln!("checked dirty card ranges on the host device");
     }
 
     /// [`Shadow::land_card`] leaves title memory and the CPU's side as
