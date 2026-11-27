@@ -267,18 +267,56 @@ pub(crate) fn early(p: &Arc<Pending>) {
         });
         within_early_compute_limit(shader.container.len(), *limit)
     });
-    if small_compute || (!p.shaders.is_empty() && super::library::wanted_early(&p.key)) {
+    let small_screen = early_screen(p);
+    if small_compute || small_screen || (!p.shaders.is_empty() && super::library::wanted_early(&p.key)) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
         if small_compute {
             static SAID: std::sync::Once = std::sync::Once::new();
             SAID.call_once(|| tracing::info!("first small compute pipeline started at creation"));
         }
+        if small_screen {
+            note_early_screen();
+        }
     }
 }
 
 fn within_early_compute_limit(bytes: usize, limit: usize) -> bool {
     bytes != 0 && bytes <= limit
+}
+
+/// Opt in to the normal early queue for small passes over the screen. Keep
+/// the reserved screen workers available for passes the title already needs.
+fn early_screen(p: &Pending) -> bool {
+    if !p.screen || !screens_first() {
+        return false;
+    }
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| {
+        let bytes = std::env::var("VICTORY_EARLY_SCREEN_MAX_BYTES")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0);
+        tracing::info!(bytes, "cold screen pipeline byte limit");
+        bytes
+    });
+    within_early_screen_limit(p.shaders.iter().map(|shader| shader.container.len()), limit)
+}
+
+fn within_early_screen_limit(sizes: impl IntoIterator<Item = usize>, limit: usize) -> bool {
+    let mut used = 0;
+    for bytes in sizes {
+        if bytes == 0 || bytes > limit - used {
+            return false;
+        }
+        used += bytes;
+    }
+    used != 0
+}
+
+fn note_early_screen() {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| tracing::info!("first small screen pipeline started at creation"));
 }
 
 /// Whether the frame's budget is one for all threads together: a thread
@@ -731,6 +769,16 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn early_screen_limit_counts_all_nonempty_stages() {
+        assert!(!within_early_screen_limit([], 6144));
+        assert!(!within_early_screen_limit([1], 0));
+        assert!(!within_early_screen_limit([4096, 0], 6144));
+        assert!(within_early_screen_limit([4096, 2048], 6144));
+        assert!(!within_early_screen_limit([4096, 2049], 6144));
+        assert!(!within_early_screen_limit([usize::MAX, 1], usize::MAX));
+    }
 
     #[test]
     fn early_compute_limit_excludes_empty_and_oversized_containers() {
