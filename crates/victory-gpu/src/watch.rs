@@ -28,7 +28,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, RangeBounds};
-use std::sync::{Condvar, Mutex, RwLock};
+use std::sync::{Condvar, Mutex, OnceLock, RwLock};
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -744,13 +744,24 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
     })
 }
 
-/// Ranges of one submission closer than this are asked about together:
-/// walking the pages between them costs less than another kernel call (a
-/// call that resets written pages costs 30-70 microseconds whatever the
-/// range).
-const AHEAD_GAP: usize = (8 << 20) / PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
+
+/// Maximum clean gap included when joining adjacent requests. The default
+/// is 8 MiB. Under Wine the time spent walking the gap depends on its size.
+fn ahead_gap() -> usize {
+    static GAP: OnceLock<usize> = OnceLock::new();
+    *GAP.get_or_init(|| {
+        let kib = std::env::var("VICTORY_AHEAD_GAP_KIB")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(8192);
+        let blocks = (kib / (PAGE >> 10)).min(AHEAD_MAX);
+        tracing::info!(kib = blocks * (PAGE >> 10), "write-watch join gap");
+        blocks
+    })
+}
+
 /// Asks the kernel about many ranges `(start, end)` at once, before the
 /// [`writes`] of each: ranges close together are one asking, and `writes`
 /// then answers from the journal until [`ask_ahead_done`]. The world's
@@ -780,6 +791,7 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
         return;
     }
     let _all = (!held).then(Asking::hold_all);
+    let gap = ahead_gap();
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut runs = Vec::new();
     let mut i = 0;
@@ -788,7 +800,7 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
         let mut last = pieces[i].1;
         let mut k = i + 1;
         while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
+            && pieces[k].0 <= last.saturating_add(gap)
             && last.max(pieces[k].1) - first <= AHEAD_MAX
         {
             last = last.max(pieces[k].1);
@@ -4082,6 +4094,36 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn a_write_watch_gap_preserves_both_requested_writes() {
+        let _serial = lock_standing_asking();
+        let size = (2 << 20) + 2 * PAGE;
+        // SAFETY: fresh write-watched memory, released below.
+        let base = unsafe {
+            VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(base, 0);
+        let right = base + size - PAGE;
+        let (before, _) = writes(base, base + size, false).expect("watch the allocation");
+        // SAFETY: both bytes lie in our private allocation.
+        unsafe {
+            (base as *mut u8).write_volatile(1);
+            (right as *mut u8).write_volatile(2);
+        }
+
+        let ranges = [(base, base + PAGE), (right, right + PAGE)];
+        ask_ahead(&ranges);
+        let joined = ahead_gap() >= (right - base - PAGE) / PAGE;
+        for (start, end) in ranges {
+            assert_eq!(asked(start, end).is_some(), joined);
+            let (_, changes) = writes(start, end, false).expect("watched range");
+            assert!(changes.iter().any(|&(page, at)| page == start / PAGE && at > before));
+        }
+        ask_ahead_done();
+        // SAFETY: base is the allocation's original address.
+        assert_ne!(unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) }, 0);
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
