@@ -1084,7 +1084,7 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{Flights, changed_runs, merge_piece, outside};
+    use super::{Flights, changed_runs, merge_piece, merge_piece_scalar, outside};
 
     /// A range two flights declared is free only when both are done, in
     /// either order; a submission that declares it many times counts once.
