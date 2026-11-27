@@ -3313,7 +3313,9 @@ static FRAME_DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 pub(crate) fn frame_drew(total: u64) {
     static BEFORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = BEFORE.swap(total, Ordering::Relaxed);
-    FRAME_DRAWS.store(total.saturating_sub(before), Ordering::Relaxed);
+    let drew = total.saturating_sub(before);
+    FRAME_DRAWS.store(drew, Ordering::Relaxed);
+    crate::frame::frame_drew(drew);
 }
 
 /// Whether the part `next` can be prepared together with `ahead`, which goes
