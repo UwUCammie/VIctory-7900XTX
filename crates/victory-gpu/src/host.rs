@@ -2495,7 +2495,11 @@ impl Drop for Deferred {
 /// Buffers up to 16 MiB.
 fn upload_pool() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_POOL").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        let enabled = std::env::var_os("VICTORY_UPLOAD_POOL").is_some_and(|v| v == "1");
+        tracing::info!("list upload pool (VICTORY_UPLOAD_POOL={})", u8::from(enabled));
+        enabled
+    })
 }
 
 /// Whether a queue's submissions go to the card without a wait for each
