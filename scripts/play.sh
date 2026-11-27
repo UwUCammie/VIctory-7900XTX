@@ -8,12 +8,12 @@
 #   --rt              the title's ray-traced indirect light
 #   --windowed        a window instead of the whole screen
 #   --no-hud          without MangoHud
-#   --start           presses Enter every 4 s from 52 s to 88 s (VICTORY_KEYS, diag builds): from
+#   --start           presses Enter every 4 s from 12 s to 48 s (VICTORY_KEYS, diag builds): from
 #                     the profile screen to the first scene without anyone at the keyboard, the
-#                     world's first frame 73 s after the launch. Not sooner: the sooner the scene
-#                     starts, the oftener nobody but the heroine has a head in it, for the whole
-#                     run (docs/linux-wine.md: 4 runs of 4 at 27 s, about every other at 33 s,
-#                     with Enter from 12 s as it was, 1 of 4 at 41 s, none of 6 at 73 s).
+#                     world's first frame 33 s after the launch. (From 52 s for a day: the sooner
+#                     the scene started, the oftener nobody but the heroine had a head in it.
+#                     That was a compute pass dropped, not the time: docs/linux-wine.md, "People
+#                     without a head"; 8 runs of 8 with heads at 33 s since.)
 #                     VICTORY_KEYS=<seconds>:Enter,... as a KEY=VALUE gives other times.
 #   --wine W          proton (default): Proton's own Wine, whose write watches use the
 #                     kernel's userfaultfd and PAGEMAP_SCAN; system: Arch's Wine (not measured
@@ -83,7 +83,7 @@ if [[ $rt == 1 ]]; then export VICTORY_BVH_BUILDER=1; fi
 if [[ $windowed == 0 ]]; then export VICTORY_FULLSCREEN=1; fi   # borderless, the whole primary monitor
 if [[ $hud == 1 ]]; then export MANGOHUD=1; fi
 if [[ $start == 1 ]]; then
-    keys=""; for t in $(seq 52 4 88); do keys+="${keys:+,}$t:Enter"; done
+    keys=""; for t in $(seq 12 4 48); do keys+="${keys:+,}$t:Enter"; done
     export VICTORY_KEYS="$keys"
 fi                   # MangoHud's Vulkan layer (vkd3d-proton)
 

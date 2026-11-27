@@ -104,6 +104,61 @@ Commands, debugging switches and upstream's own description:
 [docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
 described in a comment where it is read.
 
+## Linux (Wine)
+
+The same `victory.exe` runs under Wine with vkd3d-proton, started by
+`scripts/play.sh`, the counterpart of `play.ps1`. Measured on one PC (Ryzen 9
+9900X, Radeon RX 7900 GRE 16 GB with RADV of Mesa 26.3, Proton Experimental's
+Wine 11, kernel 7.3), Series X profile, ray tracing off, in the title's first
+scene: 2.3 frames a second before this work, 21 at 3840x2160, and 36 to 37 with
+`scripts/play-1080p.sh` (the title rendering at 1920x1080, renderer patches 1,
+2 and 5, the title let above its 30 frames a second). Everything that is
+Wine's alone is behind `on_wine()` or a switch and leaves Windows as it was.
+
+You need a Vulkan driver with mesh shaders, Proton (its Wine, vkd3d-proton and
+DXVK's `dxgi.dll` are copied into a prefix of their own; `PROTON=<folder>`
+names another than Steam's Proton Experimental), Microsoft's 64-bit
+`d3dcompiler_47.dll` (`D3DCOMPILER=<path>`; Wine's own cannot compile the
+runtime's shaders), Rust with the `x86_64-pc-windows-msvc` target and
+[cargo-xwin](https://github.com/rust-cross/cargo-xwin), and your own dump of
+the title.
+
+```sh
+git clone https://github.com/avatarmanz/VIctory-7900XTX
+cd VIctory-7900XTX
+cp victory.example.toml victory.toml        # then set your paths as Wine sees them (Z:\home\...), outside this folder
+cargo xwin build --locked --profile diag -p victory --features diagnostics --target x86_64-pc-windows-msvc
+scripts/play.sh --cmd shaders                        # every shader of the title translated, once
+scripts/play.sh <your copy's executable>             # as play.ps1 does
+scripts/play-1080p.sh                                # GAME_EXE=<executable>: 1920x1080, the fastest settings measured
+```
+
+`scripts/play.sh --safe`, `--rt`, `--start` (into the first scene without the
+keyboard) and `KEY=VALUE` settings are described at the top of the script;
+`VICTORY_SCREEN=<output>` puts the window on another monitor than the primary
+one.
+
+What was found under Wine, with the runs behind each figure, the switches and
+what is still open: [docs/linux-wine.md](docs/linux-wine.md). In short:
+
+- Wine's server walked its list of views at every map and unmap: the title's
+  pages are shown with the host's `mmap` instead (`VICTORY_WINE_MAP`).
+- Programs with loops of several back edges ran vkd3d-proton's dxil-spirv out
+  of stack; they get one latch a loop (`VICTORY_SINGLE_LATCH`), and a pipeline
+  whose making ends its worker is given up (`VICTORY_PIPELINE_WATCH`).
+- Renderer patch 1 gave a black picture: amdgpu takes memory by address only as
+  one anonymous mapping, so the title's graphics pages are shown as one
+  (`VICTORY_PORT_HOME`).
+- People other than the heroine had no face in every second or third run: a
+  compute pass the title runs once was dropped while its pipeline was being
+  made. Compute passes wait for theirs (`VICTORY_COMPUTE_WAIT_MS`), and the
+  pipeline library is kept under Wine as on Windows (`VICTORY_LIBRARY_NULL`).
+- The waits around the layer's own clamps of indirect arguments emptied the
+  card under RADV; they name what they wait for (`VICTORY_CLAMP_SYNC`).
+
+Not looked at: any scene but the first, play, ray tracing, other cards and
+drivers.
+
 ## What is different here
 
 In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).

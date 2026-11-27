@@ -1,6 +1,6 @@
 #!/bin/bash
 # The title under Wine, straight into the game: Enter pressed past the title screen (--start:
-# from second 52, the world a minute and a quarter after the launch; sooner, heads go missing),
+# from second 12, the world half a minute after the launch),
 # the title rendering at 1920x1080, and the settings measured fastest on an RX 7900 GRE with a
 # picture that is there (docs/linux-wine.md, "Above the title's 30 frames a second": 27 to 28 ms
 # a frame, 36 frames a second, in the first scene, where play.sh alone has 40 ms and 25):

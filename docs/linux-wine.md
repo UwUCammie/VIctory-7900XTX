@@ -9,8 +9,9 @@ Series X profile, ray tracing off, diagnostics build.
 Every figure is of one run of `measure.py` (see Tools; `scripts/play.sh --start`, 200 s, the
 title's first scene from about second 50 on), read over seconds 100 to 200 with
 `frame-stats.py`: medians of the report lines. (`--start` pressed Enter from second 12 in
-those runs and the world's first frame came at second 33; it presses from second 52 now,
-"People without a head": the same stretch of the scene is seconds 140 to 240.) Scenes are not the same from run to
+those runs and the world's first frame came at second 33; in the runs of 2026-11-27 before
+"heads-2" it pressed from second 52, and the same stretch of the scene is seconds 140 to
+240 there.) Scenes are not the same from run to
 run; read differences under about 5 % as nothing. Logs are in `~/Games/victory-logs/`.
 
 ## Where it stands
@@ -228,7 +229,8 @@ brightness was taken (0 to 255).
 
   In the title (2026-11-27, at 1920x1080): the log says the stretch was "opened as a host
   heap where the title has it", `card_reads_it=Some(true)`; the picture is there (the frames
-  kept of runs 33, 34 and 40: the street at night, people with their heads); no submission
+  kept of runs 33, 34 and 40: the street at night; people with their heads in 33 and 34,
+  and not in 40, which is not this patch's doing: "People without a head"); no submission
   was refused in the launches with it. (In 3 of the first 13 the card read zeros in the
   heap: below, with what was changed.) The frame is the title's own 33.3 ms with patch 1
   alone (run 33: 33.4 ms where run 30 has 40.5) and with all five (run 34: 33.3 ms), the
@@ -292,6 +294,87 @@ opening cutscene, the same moments of it side by side (`VICTORY_CAPTURE_WORLD`):
   are missing in about every other run were missing before it, in the dark (next section).
 
 ## People without a head, in about every other run
+
+**Found and put right on 2026-11-27 ("The cause", next); what follows it is the search as
+it went before, kept for what it ruled out.**
+
+### The cause: a compute pass the title runs once was dropped
+
+Two frames recorded in two runs at the same shot, one with the man's face (run 68) and one
+without (run 75), run again without a screen (`victory replay`, docs/replay.md), and read
+back step by step:
+
+1. The draw of the face's skin is there in both (`MS_VS_PedTransformPreSkinD`, mesh
+   `f841ad74ec6e7367`), at the same place of the same list. Its indirect arguments ask for
+   94 groups of meshlets in the frame with a face and for 10 in the other; every other draw
+   of that pass asks for the same in both.
+2. The title's culling program (compute `9f017d9011377efa`) writes those counts. It keeps a
+   meshlet if one of its vertices lies in the picture, and takes the vertices where the
+   skinning program put them (title buffer 0xfc3be0000, the same place, +0x145100, in both
+   runs).
+3. The skinning program (compute `36e010b53acffd77`) has the same bone matrices, the same
+   mesh and the same placing in both runs. Before the bones it takes each vertex of a face
+   from what the title's face deformer (compute `970c4fbb3b017c0e`) wrote for the frame; in
+   the run without a face that holds one and the same value for every vertex: the whole
+   skin lies in one point.
+4. The deformer's inputs are alike in both runs but for one: a table of 26,744 bytes that
+   each character has (`title buffer ...+0x6878`). With a face it holds its entries; without,
+   every word of it is 0xFFFFFFFF on the card, "no entry".
+
+That table is filled once, on the card, when the character's face comes up. The layer drops
+a draw or dispatch whose host pipeline is not made within half a second a frame
+(`crates/victory-gpu/src/pipeline/make.rs`; "A pass the title runs only once and whose
+pipeline takes longer is lost", its notes say, and passes over the screen have ten seconds
+of their own for it). Under Wine no pipeline library was ever kept (below), so every run made
+all of a world's pipelines at the world's first frames: with a line in the log for each
+first use dropped, 709 to 772 compute programs lost theirs in each of five runs. In the
+three of them with heads the face's programs were first used at the world's first frame,
+for the heroine, and were made by the time the man came; in the two without (h04, h07), and
+in none of the three, they and three more compute programs (`2a3522dae6b66c17`,
+`512416d975ace48b`, `ebe4e53f031f5249`) were first used, and dropped, at the frame the man's
+face came up, 111 to 114 frames into the world. Which of the three fills the table was not
+looked for.
+
+What was changed:
+
+- **`VICTORY_COMPUTE_WAIT_MS`** (`compute_budget` in `pipeline/make.rs`; 10 s under Wine,
+  `0`: as before; on Windows as before unless set): the first use of a compute pass waits for
+  its pipeline by a budget of its own, all of a frame's waits ending together, and its
+  pipeline is made before the others'. No compute pass was dropped in any run with it, and
+  none waited a tenth of a second.
+- **`VICTORY_LIBRARY_NULL`** (`open` in `pipeline/library.rs`; on under Wine, `0`: as
+  before): an empty pipeline library is asked for with no address. vkd3d-proton refuses a
+  blob of no bytes at an address that is not null, which is what an empty slice has: "no host
+  pipeline library: pipelines are not kept" was in every run's log, and nothing was started
+  early in the next run. With it the second run loads the library (315 kB), starts 1,776
+  pipelines during loading and drops 7 first uses where the runs before dropped 400 to 630
+  (runs e07 and e08).
+
+Counted on frames kept of the shot where both raise their hands, 25 to 30 s into the world
+(`VICTORY_AMBIENT=constant:0.3` to see faces by; lists `heads-1.txt` and `heads-2.txt`):
+
+| Compute passes | The world's first frame | Runs | Without heads |
+|---|---|---|---|
+| dropped as before (`VICTORY_COMPUTE_WAIT_MS=0`), by turns with the next | 73 s after the launch | 5 | 2 (h04, h07) |
+| waited for | 73 s | 9 | 0 |
+| waited for | 33 s (Enter from second 12, where 22 runs of 45 were without) | 8 | 0 |
+
+Of the runs of the night before whose frames show the man (runs 32 to 84, all at 73 s, none
+with the wait) 6 of 18 were without heads: waiting a minute before the first Enter did not
+put it right, as the table below had it from 13 runs. (Run 40, taken for whole above from its
+early frames, is one of the six.)
+
+The picture and the frame are as before with both: the frames of the world kept of a run
+with them, set as run 52 was, are the same shots in the same light (mean brightness 32.9
+and 33.0 over 818 and 816 frames, run 86), and the launcher's settings give 27.1 ms a frame,
+37.0 frames a second (run 87; 27.1 to 28.1 before).
+
+Not known: why the heroine's face came up at the world's first frame in some runs and not in
+others; whether Windows has it in a first run, with no library yet. Draws are still dropped
+while their pipeline is being made, 400 to 630 first uses in a run with no library: one that
+draws once into something kept would be lost the same way (passes over the screen are not).
+
+### The search before (2026-11-26)
 
 In about every other run nobody but the heroine has a head: its skin is not drawn, from the
 first shot of the opening cutscene that shows one (14 s after the world's first frame) to the
@@ -670,8 +753,24 @@ merged), with what this PC had already:
   (`sheet-80-fsr4.png` beside the logs). No submission refused, no hang, in three launches.
 - On a monitor of 1920x1080 this gains no frame: the picture is made at 1920x1080 where
   `VICTORY_OUTPUT=1920x1080` makes it at 1280x720, and put out at four times the monitor's
-  pixels. An FSR profile that puts out 1920x1080 does not exist (`fsr_4k.rs` patches the
-  title's 4K mode alone). Whether FSR 4's picture is better than 3.1's here was not judged.
+  pixels.
+- Putting out 1920x1080 (the test tree only, not committed; the changes are kept as
+  `patches/fsr-output-and-version.patch` beside the logs): with a profile `VICTORY_OUTPUT`
+  is applied as without one, the picture made at the preset's share of it, and a preset
+  `native` makes it at the output's own size. The launcher's settings, main's order of
+  clamps off as on this branch (`VICTORY_PORT_CONSTANTS_ORDER=0`), runs 81 to 85:
+
+  | Upscaler | Picture made at | Frame (median) | fps |
+  |---|---|---|---|
+  | the title's own | 1280x720 | 27.3 ms | 36.6 |
+  | FSR 4.1.1 `quality` | 1280x720 | 27.7 ms | 36.1 |
+  | FSR 3.1.5 `quality` | 1280x720 | 27.6 ms | 36.2 |
+  | FSR 4.1.1 `performance` | 960x540 | 26.3 ms | 38.0 |
+  | FSR 4.1.1 `native` | 1920x1080 | 32.8 ms | 30.5 |
+
+  All five ran to their end. Whether FSR 4's picture is better than the title's own or
+  than 3.1's was not judged; in the one frame looked at of `performance` the heroine's face
+  is white, which was not looked into.
 
 ## What the calls cost under Proton's Wine
 
@@ -710,13 +809,10 @@ lock for a third of a millisecond at a time, 2,000 times a second.
 
 ## What is not known, and what is next
 
-1. Why nobody but the heroine has a head when the scene starts within half a minute of the
-   launch ("People without a head"): what is not ready then. `--start` waits now; the cause
-   stands. Not the six programs, not the launcher's faster ways, no stale copy. Next: which
-   of the presses it is (the profile's early and the rest late); find the head's draw in an
-   operation list of a run with heads (its vertices come pre-skinned from `bvh_skinning`'s
-   programs, its meshlets through `CS_BatchCullPreSkinnedMeshlets`) and see what it is given
-   in a run without; what writes the 24 MiB at 0xff69e0000 undeclared; the same on Windows.
+1. People without a head: found and put right ("The cause: a compute pass the title runs
+   once was dropped"). Left of it: draws dropped while their pipeline is being made could
+   lose a pass that draws once the same way; whether a first run on Windows has it.
+   (`--start` presses from second 12 again.)
 2. The card hung in run C11, 31 s into the world, with nothing set but the output size, the
    ambient constant and the monitor: `amdgpu: ring gfx_0.0.0 timeout` naming the title's
    `vkd3d_queue` thread, "Illegal opcode in command stream", and the ring's reset failed
