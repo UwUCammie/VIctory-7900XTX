@@ -88,6 +88,10 @@ fn build() -> [u8; 32] {
     // The view heap's null slot differs by host GPU: a translation cached
     // without the clamp must not be served (`host_settings` below).
     crate::descriptor::host::probe_view_limit();
+    cache_key()
+}
+
+fn cache_key() -> [u8; 32] {
     static FIXED: OnceLock<Vec<u8>> = OnceLock::new();
     let fixed = FIXED.get_or_init(|| {
         let limit = victory_shader::emit::loop_limit();
@@ -506,6 +510,44 @@ mod tests {
             }],
             half_views: vec![(0, 8), (4, 0)],
         }
+    }
+
+    #[test]
+    fn raw_typed_load_modes_have_distinct_cache_keys() {
+        const CHILD: &str = "VICTORY_TEST_PRINT_RAW_TYPED_CACHE_KEY";
+        const OPTION: &str = "VICTORY_RAW_TYPED_LOADS";
+        const MARKER: &str = "raw-typed-cache-key=";
+        if std::env::var_os(CHILD).is_some() {
+            println!("\n{MARKER}{}", blake3::Hash::from_bytes(cache_key()));
+            return;
+        }
+        // Each launch samples its environment once, just like the renderer.
+        let key = |value: Option<&str>| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "shader_cache::tests::raw_typed_load_modes_have_distinct_cache_keys",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove("VICTORY_SHADER_KEY");
+            match value {
+                Some(value) => command.env(OPTION, value),
+                None => command.env_remove(OPTION),
+            };
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix(MARKER))
+                .unwrap()
+                .to_owned()
+        };
+        let on = key(Some("1"));
+        assert_eq!(key(None), on);
+        assert_ne!(key(Some("0")), on);
     }
 
     #[test]
