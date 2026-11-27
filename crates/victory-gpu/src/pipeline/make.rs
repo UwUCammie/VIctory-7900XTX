@@ -617,6 +617,14 @@ fn wait(p: &Arc<Pending>, frame: u64) {
     if screen {
         prefer_waiter(p, started, started + left);
     }
+    let trace_id = if screen && trace_request_latency() && p.made.get().is_none() && !p.lost.load(Ordering::Relaxed) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(id, frame, key = p.key.as_str(), "screen pipeline wait started");
+        Some(id)
+    } else {
+        None
+    };
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() && !p.lost.load(Ordering::Relaxed) {
@@ -629,6 +637,9 @@ fn wait(p: &Arc<Pending>, frame: u64) {
     drop(held);
     let waited = started.elapsed().min(left);
     waiting.end();
+    if let Some(id) = trace_id {
+        tracing::info!(id, "screen pipeline wait ended");
+    }
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
             ms = waited.as_millis() as u64,
