@@ -1277,7 +1277,12 @@ mod host {
                 };
                 Some((from, to, vk))
             });
-            (Instant::now(), keys.collect())
+            let keys: Vec<_> = keys.collect();
+            let start = Instant::now();
+            if !keys.is_empty() {
+                tracing::info!(events = keys.len(), "scripted input clock started");
+            }
+            (start, keys)
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
