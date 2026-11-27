@@ -4925,6 +4925,10 @@ mod land_tests {
                         }
                     }
                 }
+                if round % 2 == 0 {
+                    dirty.clear();
+                    sent.clear();
+                }
                 let after = 4u64;
                 for (shadow, at) in [(&one, a), (&many, b)] {
                     crate::watch::writing(at, LEN);
@@ -4949,6 +4953,7 @@ mod land_tests {
                 assert!(bytes(one.data as usize) == bytes(many.data as usize), "the CPU's side, round {round}");
             }
         }
+        eprintln!("verified 80 relay landing pairs");
     }
 
     /// Landings of one copy on several threads, the title writing dwords of
