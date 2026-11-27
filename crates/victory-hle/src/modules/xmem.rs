@@ -1512,36 +1512,36 @@ pub extern "system" fn XMemMapPhysicalPages(
     if let Some(costed) = &mut costed {
         costed.waited = costed.started.elapsed().as_nanos() as u64;
     }
+    // Pin the requested slices before taking any view away. The title can
+    // keep using the old mapping when a page number can no longer be served.
+    let mut slices = Vec::with_capacity(pages.as_ref().map_or(0, Vec::len));
+    if let Some(pages) = pages {
+        let table = page_table();
+        for page in pages {
+            let Some(slice) = table.pages.get(&page) else {
+                tracing::warn!(page, "XMemMapPhysicalPages: unknown page");
+                return std::ptr::null_mut();
+            };
+            slices.push(slice.clone());
+        }
+    }
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
     let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, base, n * PAGE);
-    let Some(pages) = pages else {
-        return address;
-    };
-    let slices: Vec<Option<Slice>> = {
-        let table = page_table();
-        pages.iter().map(|page| table.pages.get(page).cloned()).collect()
-    };
     let mut i = 0;
-    while i < n {
-        let Some(first) = slices[i].clone() else {
-            tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
-            return std::ptr::null_mut();
-        };
+    while let Some(first) = slices.get(i) {
         // One view per run of consecutive slices of one section.
         let run = 1 + slices[i + 1..]
             .iter()
             .zip(1..)
             .take_while(|&(slice, k)| {
-                slice.as_ref().is_some_and(|s| {
-                    Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + k
-                })
+                Arc::ptr_eq(&slice.section, &first.section) && slice.index == first.index + k
             })
             .count();
-        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
+        if !map(&mut physical, base + i * PAGE, run * PAGE, first.clone()) {
             return std::ptr::null_mut();
         }
         i += run;
@@ -2689,6 +2689,45 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    #[test]
+    fn a_remap_with_an_unknown_page_leaves_the_pages_it_showed() {
+        let mut pages = [0usize; 3];
+        let mut count = pages.len();
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut count, pages.as_mut_ptr()), 1);
+        assert_eq!(count, pages.len());
+        let base = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!base.is_null());
+        let second = base.wrapping_byte_add(PAGE);
+        assert_eq!(XMemMapPhysicalPages(base, 2, pages.as_ptr()), base);
+        // SAFETY: Both pages are mapped read-write.
+        unsafe {
+            base.cast::<u8>().write(0x5a);
+            second.cast::<u8>().write(0xa5);
+        }
+        assert_eq!(XMemFreePhysicalPages(1, pages[1..].as_ptr()), 1);
+
+        // A different first page could be mapped, but the second is gone.
+        // The old first page must survive too.
+        let request = [pages[2], pages[1]];
+        assert!(XMemMapPhysicalPages(base, request.len(), request.as_ptr()).is_null());
+        assert_eq!(query(base).host.State, MEM_COMMIT);
+        assert_eq!(query(second).host.State, MEM_COMMIT);
+        // SAFETY: The committed pages above remain readable.
+        unsafe {
+            assert_eq!(base.cast::<u8>().read(), 0x5a);
+            assert_eq!(second.cast::<u8>().read(), 0xa5);
+        }
+        assert_eq!(XMemMapPhysicalPages(base, 2, std::ptr::null()), base);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(1, pages[2..].as_ptr()), 1);
     }
 
     /// A thread that reads a mapped page in place, as the GPU side reads a
