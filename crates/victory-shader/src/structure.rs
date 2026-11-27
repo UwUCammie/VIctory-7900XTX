@@ -16,7 +16,7 @@
 //! their side effects are dropped too, and what they compute is only read
 //! through derivatives.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::ShaderError;
@@ -171,18 +171,20 @@ impl Bools {
         if lo == hi {
             return lo;
         }
-        if let Some(&b) = self.unique.get(&(v, lo, hi)) {
-            return b;
+        match self.unique.entry((v, lo, hi)) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                if self.nodes.len() >= MAX_NODES {
+                    // The caller fails once it sees `overflow`.
+                    self.overflow = true;
+                    return Bool::FALSE;
+                }
+                let b = Bool(self.nodes.len() as u32);
+                self.nodes.push((v, lo, hi));
+                entry.insert(b);
+                b
+            }
         }
-        if self.nodes.len() >= MAX_NODES {
-            // The caller fails once it sees `overflow`.
-            self.overflow = true;
-            return Bool::FALSE;
-        }
-        let b = Bool(self.nodes.len() as u32);
-        self.nodes.push((v, lo, hi));
-        self.unique.insert((v, lo, hi), b);
-        b
     }
 
     /// Cofactors of `b` for `v`, which is `b`'s top variable or above it.
@@ -199,6 +201,12 @@ impl Bools {
         }
         if f == Bool::FALSE {
             return h;
+        }
+        // If a branch repeats the condition, its value on that branch is known.
+        let g = if f == g { Bool::TRUE } else { g };
+        let h = if f == h { Bool::FALSE } else { h };
+        if g == h {
+            return g;
         }
         if (g, h) == (Bool::TRUE, Bool::FALSE) {
             return f;
@@ -1438,6 +1446,19 @@ mod tests {
     fn build(words: &[u32], wave64: bool) -> Program {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         ir::build(&code, wave64, 256).unwrap()
+    }
+
+    #[test]
+    fn a_branch_equal_to_its_condition_has_a_known_value() {
+        let mut b = Bools::new();
+        let x = b.atom(Atom::Constant(1), 0);
+        let y = b.atom(Atom::Constant(2), 0);
+        let x_or_y = b.or(x, y);
+        let x_and_y = b.and(x, y);
+        assert_eq!(b.ite(x, x, y), x_or_y);
+        assert_eq!(b.ite(x, y, x), x_and_y);
+        assert_eq!(b.ite(x, x, Bool::TRUE), Bool::TRUE);
+        assert_eq!(b.ite(x, Bool::FALSE, x), Bool::FALSE);
     }
 
     fn guarded(s: &Structured) -> usize {
