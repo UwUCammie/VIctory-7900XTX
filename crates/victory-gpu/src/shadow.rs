@@ -16,8 +16,8 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -130,7 +130,7 @@ struct Card {
     /// Locked inside `dirty`'s lock.
     sent: Mutex<SentRuns>,
     /// Whether something was put into `dirty` since it was last taken.
-    touched: std::sync::atomic::AtomicBool,
+    touched: Arc<AtomicBool>,
     /// Whether the copy is in [`TOUCHED`] (once, until it is asked).
     listed: std::sync::atomic::AtomicBool,
     /// The copy itself, for [`TOUCHED`]: set where the copy is put in
@@ -330,8 +330,14 @@ pub(crate) fn card_room_kept() -> u64 {
     card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
 }
 
-/// The copies in the card's memory.
-static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+struct CardEntry {
+    shadow: Weak<Shadow>,
+    /// Shares the dirty flag without keeping the buffer or its GPU allocation alive.
+    touched: Arc<AtomicBool>,
+}
+
+/// The copies in the card's memory, in registration order.
+static CARDED: Mutex<Vec<CardEntry>> = Mutex::new(Vec::new());
 
 /// The copies in the card's memory something was put into `dirty` of since
 /// they were last asked ([`card_dirty`]): what `VICTORY_CARD_TOUCHED=1` asks
@@ -357,18 +363,29 @@ fn touched_only() -> bool {
     })
 }
 
+fn skip_clean_upgrades() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let enabled = std::env::var_os("VICTORY_CARD_SKIP_CLEAN_UPGRADES").is_some_and(|v| v == "1");
+        tracing::info!(enabled, "card copy clean reference check");
+        enabled
+    })
+}
+
 /// Puts a copy that has a card side in [`CARDED`], and tells it what it is
 /// ([`Card::me`], for [`TOUCHED`]).
 fn carded(shadow: &Arc<Shadow>) {
+    let Some(card) = &shadow.card else { return };
     let weak = Arc::downgrade(shadow);
-    if let Some(card) = &shadow.card {
-        let _ = card.me.set(weak.clone());
-        // Changed before it knew itself: listed now.
-        if card.touched.load(Ordering::Acquire) && !card.listed.swap(true, Ordering::AcqRel) {
-            TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).push(weak.clone());
-        }
+    let _ = card.me.set(weak.clone());
+    // Changed before it knew itself: listed now.
+    if card.touched.load(Ordering::Acquire) && !card.listed.swap(true, Ordering::AcqRel) {
+        TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).push(weak.clone());
     }
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(weak);
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(CardEntry {
+        shadow: weak,
+        touched: Arc::clone(&card.touched),
+    });
 }
 
 /// Since the last frame line: bytes copied to card sides and the ranges
@@ -391,7 +408,7 @@ pub(crate) fn card_stats() -> [u64; 10] {
     for (i, stat) in CARD_STATS.iter().enumerate() {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
-    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
+    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|entry| entry.shadow.strong_count() > 0).count() as u64;
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed)
         + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
         + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed);
@@ -714,7 +731,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         // The dead ones go once in a while, not at every asking.
         static ASKED: AtomicU64 = AtomicU64::new(0);
         if ASKED.fetch_add(1, Ordering::Relaxed) % 4096 == 4095 {
-            carded.retain(|weak| weak.strong_count() > 0);
+            carded.retain(|entry| entry.shadow.strong_count() > 0);
         }
         return out;
     }
@@ -725,14 +742,20 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
             c.listed.store(false, Ordering::Release);
         }
     }
-    carded.retain(|weak| {
-        let Some(shadow) = weak.upgrade() else {
+    let skip_clean = skip_clean_upgrades();
+    carded.retain(|entry| {
+        // Use the same exchange as the full scan. A concurrent writer that
+        // sets the flag after it is taken will still be seen on the next scan.
+        if skip_clean && !entry.touched.swap(false, Ordering::AcqRel) {
+            return entry.shadow.strong_count() > 0;
+        }
+        let Some(shadow) = entry.shadow.upgrade() else {
             return false;
         };
         let ranges = shadow
             .card
             .as_ref()
-            .filter(|c| c.touched.swap(false, Ordering::AcqRel))
+            .filter(|c| skip_clean || c.touched.swap(false, Ordering::AcqRel))
             .map(|c| {
                 let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
                 let ranges = joined(std::mem::take(&mut *dirty));
@@ -846,7 +869,7 @@ pub(crate) fn send_copied(dst: usize, len: usize) {
 
 /// The copies in the card's memory (diagnostics: `crate::host::upcheck`).
 pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(std::sync::Weak::upgrade).collect()
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(|entry| entry.shadow.upgrade()).collect()
 }
 
 /// Ranges in order, those that overlap or touch as one.
@@ -5066,6 +5089,10 @@ mod land_tests {
 
         let dirty = super::card_dirty(1);
         assert_eq!(dirty.len(), 2);
+        if !super::touched_only() {
+            assert!(Arc::ptr_eq(&dirty[0].0, &before_registration));
+            assert!(Arc::ptr_eq(&dirty[1].0, &after_registration));
+        }
         for (copy, range) in [(&before_registration, (4, 20)), (&after_registration, (32, 64))] {
             let entry = dirty.iter().find(|(shadow, _)| Arc::ptr_eq(shadow, copy)).expect("dirty copy");
             assert_eq!(entry.1, [range]);
