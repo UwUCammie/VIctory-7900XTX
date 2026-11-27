@@ -46,6 +46,7 @@ pub(crate) struct Pending {
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
+    done: (Mutex<()>, Condvar),
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
     key: String,
@@ -86,6 +87,7 @@ impl Pending {
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
             made: OnceLock::new(),
+            done: (Mutex::new(()), Condvar::new()),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
             lost: AtomicBool::new(false),
@@ -116,7 +118,24 @@ impl Pending {
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
         });
-        let (lock, done) = &DONE;
+        self.notify_waiters();
+    }
+
+    fn wait_signal(&self) -> &(Mutex<()>, Condvar) {
+        static LOCAL: OnceLock<bool> = OnceLock::new();
+        if *LOCAL.get_or_init(|| {
+            let local = std::env::var_os("VICTORY_BENCH_LOCAL_PIPELINE_NOTIFY").is_some_and(|value| value == "1");
+            tracing::info!(local, "pipeline completion notification mode");
+            local
+        }) {
+            &self.done
+        } else {
+            &DONE
+        }
+    }
+
+    fn notify_waiters(&self) {
+        let (lock, done) = self.wait_signal();
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
@@ -311,7 +330,7 @@ fn wait_compute(p: &Pending, frame: u64, budget: Duration) {
     };
     let waiting = crate::timeline::span("pipeline: first use waits for a host pipeline");
     let started = Instant::now();
-    let (lock, done) = &DONE;
+    let (lock, done) = p.wait_signal();
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() && !p.lost.load(Ordering::Relaxed) {
         let rest = until.saturating_duration_since(Instant::now());
@@ -367,7 +386,7 @@ fn wait(p: &Pending, frame: u64) {
     }
     let waiting = crate::timeline::span("pipeline: first use waits for a host pipeline");
     let started = Instant::now();
-    let (lock, done) = &DONE;
+    let (lock, done) = p.wait_signal();
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() && !p.lost.load(Ordering::Relaxed) {
         let rest = left.saturating_sub(started.elapsed());
@@ -661,9 +680,7 @@ fn watch(mut workers: Vec<(usize, bool, std::thread::JoinHandle<()>)>, stack: Op
                     shaders = ?p.shaders,
                     "a host pipeline's making ended its worker (under Wine: the host ran out of stack?): the title goes without this pipeline"
                 );
-                let (lock, done) = &DONE;
-                let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
-                done.notify_all();
+                p.notify_waiters();
             } else {
                 tracing::warn!(worker = i, "a pipeline worker ended with no pipeline in the making");
             }
