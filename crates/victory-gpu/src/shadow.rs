@@ -1009,11 +1009,11 @@ impl Flights {
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     let mut differs = 0u8;
     for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
-        let wrote = if *n != *h { 0xffu8 } else { 0 };
-        let merged = (*t & !wrote) | (*n & wrote);
+        let merged = if *n == *h { *t } else { *n };
         differs |= merged ^ *t;
         *t = merged;
-        *h = (*h & !wrote) | (*n & wrote);
+        // Whether it changed or already matched, this is what the card held.
+        *h = *n;
     }
     differs != 0
 }
